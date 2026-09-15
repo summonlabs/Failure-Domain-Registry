@@ -596,6 +596,36 @@ bool decode_membership(codec::Reader& reader, Membership* record) {
   return true;
 }
 
+} // namespace
+
+/// Byte width of a record in the persisted encoding. Used by the mutation paths
+/// to enforce max_record_bytes against the real encoder rather than a proxy.
+std::size_t encoded_domain_bytes(const FailureDomain& record) {
+  codec::Writer writer;
+  encode_domain(writer, record);
+  return writer.size();
+}
+
+std::size_t encoded_membership_bytes(const Membership& record) {
+  codec::Writer writer;
+  encode_membership(writer, record);
+  return writer.size();
+}
+
+std::size_t encoded_relation_bytes(const DomainRelation& record) {
+  codec::Writer writer;
+  writer.bytes(record.id.to_string());
+  writer.bytes(record.source.to_string());
+  writer.bytes(record.target.to_string());
+  writer.u8(static_cast<std::uint8_t>(record.type));
+  encode_provenance(writer, record.provenance);
+  writer.u64(record.created_at.value());
+  writer.u64(record.created_epoch.value());
+  return writer.size();
+}
+
+namespace {
+
 void rebuild_indexes(RegistryState& state) {
   state.by_entity.clear();
   state.by_domain.clear();
@@ -624,8 +654,8 @@ void rebuild_indexes(RegistryState& state) {
     const Membership& record = *entry.second;
     state.by_entity[record.member.id()].push_back(record.id);
     state.by_domain[record.domain].push_back(record.id);
-    if (record.provenance.has_publisher()) {
-      state.by_publisher[record.provenance.publisher].push_back(record.id);
+    for (const PublisherId& publisher : membership_evidence_publishers(record)) {
+      state.by_publisher[publisher].push_back(record.id);
     }
     const auto slot = static_cast<std::size_t>(record.lifecycle);
     if (slot < kLifecycleSlots) {
@@ -1082,6 +1112,69 @@ bool decode_payload(std::string_view payload, RegistryState* state, std::string*
     state->rules[rule.id] = std::move(rule);
   }
 
+  // Generation invariants: a membership must name a domain generation that
+  // actually existed. A generation above the domain's current one could never
+  // have been produced by this runtime.
+  for (const auto& entry : state->memberships) {
+    const Membership& record = *entry.second;
+    const auto domain_it = state->domains.find(record.domain);
+    if (domain_it == state->domains.end()) {
+      *error = "membership references a domain that is not in the image";
+      return false;
+    }
+    if (record.domain_generation.is_zero() ||
+        record.domain_generation.value() > domain_it->second->generation.value()) {
+      *error = "membership names a domain generation that never existed";
+      return false;
+    }
+  }
+
+  // Relation invariants: the image must not hold a cycle over a relation type
+  // that is acyclic by definition. Cycles are detected per relation type,
+  // exactly as the runtime applies them.
+  for (std::uint8_t raw = 1; raw <= kDomainRelationTypeCount; ++raw) {
+    const auto relation_type = static_cast<DomainRelationType>(raw);
+    if (!is_acyclic_relation(relation_type)) {
+      continue;
+    }
+    std::unordered_map<FailureDomainId, std::vector<FailureDomainId>> edges;
+    for (const auto& entry : state->relations) {
+      const DomainRelation& record = *entry.second;
+      if (record.type != relation_type) {
+        continue;
+      }
+      edges[record.source].push_back(record.target);
+    }
+    std::unordered_map<FailureDomainId, int> colour;
+    std::vector<std::pair<FailureDomainId, std::size_t>> stack;
+    for (const auto& start : edges) {
+      if (colour[start.first] != 0) {
+        continue;
+      }
+      stack.clear();
+      stack.emplace_back(start.first, 0);
+      colour[start.first] = 1;
+      while (!stack.empty()) {
+        std::pair<FailureDomainId, std::size_t>& frame = stack.back();
+        const auto it = edges.find(frame.first);
+        if (it == edges.end() || frame.second >= it->second.size()) {
+          colour[frame.first] = 2;
+          stack.pop_back();
+          continue;
+        }
+        const FailureDomainId next = it->second[frame.second++];
+        if (colour[next] == 1) {
+          *error = "the image holds a cycle over an acyclic relation type";
+          return false;
+        }
+        if (colour[next] == 0) {
+          colour[next] = 1;
+          stack.emplace_back(next, 0);
+        }
+      }
+    }
+  }
+
   if (!reader.exhausted()) {
     *error = "payload carries trailing bytes that no record accounts for";
     return false;
@@ -1347,8 +1440,9 @@ Outcome inspect_persistence(const PersistenceConfig& config, PersistenceReport* 
     report->generation = loaded.generation;
     report->epoch = loaded.epoch;
     report->format_version = version;
-    const DigestBytes digest = sha256(body.data(), body.size());
-    report->digest = StateDigest::from_bytes(digest);
+    // The semantic state digest, not the container's payload hash: this is the
+    // value a consumer compares against Registry::state_digest().
+    report->digest = compute_state_digest_of(loaded);
   }
   Outcome outcome = Outcome::make(OutcomeCode::Committed, "image is readable and verified");
   outcome.steps.push_back(ExplanationStep{"inspect", "bytes", std::to_string(container.size()),

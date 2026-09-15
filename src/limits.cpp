@@ -57,8 +57,16 @@ ValidationResult RegistryLimits::validate() const {
   if (!result) return result;
   result = check_bound("max_hierarchy_depth", max_hierarchy_depth, hard_limits::kMaxHierarchyDepth, 1);
   if (!result) return result;
+  // max_hierarchy_depth is enforced when a containment edge is added, so a walk
+  // bounded by max_ancestor_walk can never truncate silently as long as the walk
+  // bound is at least the hierarchy bound.
   result = check_bound("max_ancestor_walk", max_ancestor_walk, hard_limits::kMaxAncestorWalk, 1);
   if (!result) return result;
+  if (max_ancestor_walk < max_hierarchy_depth) {
+    return ValidationResult::failure(
+        "max_ancestor_walk must be at least max_hierarchy_depth, otherwise a hierarchy walk "
+        "could truncate silently");
+  }
   result = check_bound("max_history_entries_per_record", max_history_entries_per_record,
                        hard_limits::kMaxHistoryEntriesPerRecord, 1);
   if (!result) return result;
@@ -72,11 +80,8 @@ ValidationResult RegistryLimits::validate() const {
   if (!result) return result;
   result = check_bound("max_publishers", max_publishers, hard_limits::kMaxPublishers, 1);
   if (!result) return result;
-  result = check_bound("max_coverage_declarations", max_coverage_declarations,
-                       hard_limits::kMaxCoverageDeclarations, 1);
-  if (!result) return result;
-  return check_bound("max_snapshots_retained", max_snapshots_retained,
-                     hard_limits::kMaxSnapshotsRetained, 1);
+  return check_bound("max_coverage_declarations", max_coverage_declarations,
+                     hard_limits::kMaxCoverageDeclarations, 1);
 }
 
 ValidationResult FrameLimits::validate() const {

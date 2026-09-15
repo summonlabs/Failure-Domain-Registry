@@ -285,6 +285,16 @@ Outcome Coordinator::Impl::dispatch(std::string_view payload, std::string* rende
       }
       return outcome;
     }
+    case Operation::UpdateDomain: {
+      UpdateDomainRequest body = request.update_domain;
+      body.attempt = attempt;
+      body.authority = authority_for(body.provenance);
+      const Outcome outcome = registry.update_domain(body);
+      if (outcome.committed()) {
+        static_cast<void>(save_if_configured());
+      }
+      return outcome;
+    }
     case Operation::AttachMember: {
       AttachMemberRequest body = request.attach_member;
       body.attempt = attempt;
@@ -495,8 +505,12 @@ void Coordinator::Impl::serve(std::shared_ptr<TcpSocket> socket,
   // Session loss is detected here, through the real socket, and fences exactly
   // the incarnation that owned this connection.
   if (attached) {
+    // Fencing is a committed state change, so it is persisted before the
+    // session is torn down: a coordinator that dies after a publisher is lost
+    // must not come back believing the lost incarnation is still authoritative.
     static_cast<void>(registry.fence_worker(attached_publisher, attached_boot,
                                             FenceReason::SessionLost, registry.epoch()));
+    static_cast<void>(save_if_configured());
     const std::lock_guard<std::mutex> guard(stats_mutex);
     ++stats.workers_fenced;
   }

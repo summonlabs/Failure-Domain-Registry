@@ -1024,14 +1024,13 @@ FDR_TEST_CASE(authority, a_fresh_boot_fences_the_previous_incarnation_and_withdr
     FDR_CHECK(record->history.empty());
 
     // A domain that rests on process-bound evidence is NOT demoted here: this
-    // path fences the old incarnation and withdraws its membership evidence,
-    // while demoting domains is done by an explicit fence_worker call (see
-    // fencing_demotes_process_bound_classification_and_keeps_durable_classification).
-    // The difference is asserted so that a change to either path is caught.
+    // Every fence path runs the same code: reincarnation withdraws the old
+    // incarnation's process-bound evidence and demotes the process-bound domain
+    // it established, so a process-bound domain can never outlive its publisher.
     record = fixture.registry.domain(*process_bound.domain);
     FDR_CHECK(record.has_value());
-    FDR_CHECK_EQ(record->lifecycle, DomainLifecycle::Current);
-    FDR_CHECK_EQ(record->generation.value(), std::uint64_t{1});
+    FDR_CHECK_EQ(record->lifecycle, DomainLifecycle::RevalidationRequired);
+    FDR_CHECK(record->generation.value() >= 2);
     FDR_CHECK(is_process_bound_evidence(record->provenance.evidence));
     check_state(fixture.registry);
 }
@@ -1173,10 +1172,10 @@ FDR_TEST_CASE(authority, fencing_demotes_process_bound_classification_and_keeps_
     FDR_CHECK_EQ(fixture.registry.domains_in_lifecycle(DomainLifecycle::Current).size(), std::size_t{1});
     FDR_CHECK_EQ(fixture.registry.domains_in_lifecycle(DomainLifecycle::RevalidationRequired).size(), std::size_t{1});
 
-    // Membership evidence is an attestation by an incarnation: the entries the
-    // fenced incarnation published are withdrawn, and a membership left without
-    // live evidence must be reconciled. That is true of the durable class as
-    // well, which is why the domain, not the membership, is what survives.
+    // Membership evidence follows the same rule as domain provenance: the
+    // fenced incarnation's process-bound entries are withdrawn and a membership
+    // left without live evidence is demoted, while an entry published with a
+    // durable class never depended on the process and survives the fence.
     const MembershipKey measured_key{*process_bound.domain, measured_member.id(), measured_member.generation(),
                                      MembershipKind::Direct};
     const MembershipKey declared_key{*durable.domain, declared_member.id(), declared_member.generation(),
@@ -1192,9 +1191,10 @@ FDR_TEST_CASE(authority, fencing_demotes_process_bound_classification_and_keeps_
 
     membership = fixture.registry.membership(membership_id_for(declared_key));
     FDR_CHECK(membership.has_value());
-    FDR_CHECK_EQ(membership->lifecycle, MembershipLifecycle::RevalidationRequired);
-    FDR_CHECK(membership->evidence.empty());
-    FDR_CHECK_EQ(fixture.registry.memberships_in_lifecycle(MembershipLifecycle::Current).size(), std::size_t{0});
+    FDR_CHECK_EQ(membership->lifecycle, MembershipLifecycle::Current);
+    FDR_CHECK_EQ(membership->live_evidence_count(), std::size_t{1});
+    FDR_CHECK_EQ(fixture.registry.memberships_in_lifecycle(MembershipLifecycle::Current).size(),
+                 std::size_t{1});
 
     // The domain the fence demoted refuses members until it is revalidated.
     const EntityRef later_member = entity_ref(EntityClass::Switch, 6u, 1u);

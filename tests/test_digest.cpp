@@ -747,9 +747,12 @@ FDR_TEST_CASE(digest, canonical_forms_are_deterministic_and_field_sensitive) {
     FDR_CHECK(membership_changes(other));
   }
   {
+    // The evidence counter is per-registry bookkeeping, so it is deliberately
+    // excluded from the semantic form: two registries that recorded the same
+    // classification must digest identically.
     Membership other = membership;
     other.evidence_generation = EvidenceGeneration(7);
-    FDR_CHECK(membership_changes(other));
+    FDR_CHECK(!membership_changes(other));
   }
   {
     Membership other = membership;
@@ -771,7 +774,7 @@ FDR_TEST_CASE(digest, canonical_forms_are_deterministic_and_field_sensitive) {
   {
     Membership other = membership;
     other.provenance.evidence_generation = EvidenceGeneration(9);
-    FDR_CHECK(membership_changes(other));
+    FDR_CHECK(!membership_changes(other));
   }
   {
     Membership other = membership;
@@ -817,7 +820,7 @@ FDR_TEST_CASE(digest, canonical_forms_are_deterministic_and_field_sensitive) {
   {
     Provenance other = provenance;
     other.evidence_generation = EvidenceGeneration(3);
-    FDR_CHECK(provenance_changes(other));
+    FDR_CHECK(!provenance_changes(other));
   }
   {
     Provenance other = provenance;
@@ -1138,12 +1141,13 @@ FDR_TEST_CASE(digest, state_digest_is_order_sensitive_to_evidence_publication) {
   const std::vector<std::string> backward_forms = membership_forms(backward, domain);
   FDR_CHECK_EQ(backward_forms.size(), std::size_t{2});
 
-  // Same records, same counts, same classification: only arrival order differs.
+  // Same records, same counts, same classification: only arrival order differs,
+  // and the semantic digest must not be able to tell the two registries apart.
   FDR_CHECK_EQ(forward.domain_count(), backward.domain_count());
   FDR_CHECK_EQ(forward.membership_count(), backward.membership_count());
   FDR_CHECK_EQ(forward.members_of(domain).size(), backward.members_of(domain).size());
-  FDR_CHECK(!(forward.state_digest() == backward.state_digest()));
-  FDR_CHECK(!(forward_forms == backward_forms));
+  FDR_CHECK(forward.state_digest() == backward.state_digest());
+  FDR_CHECK(forward_forms == backward_forms);
   FDR_CHECK_EQ(forward_forms[0].size(), backward_forms[0].size());
 
   std::string why;

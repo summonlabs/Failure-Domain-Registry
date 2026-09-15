@@ -121,14 +121,16 @@ std::string Membership::canonical_form() const {
   append_u8(out, static_cast<std::uint8_t>(kind));
   append_u8(out, static_cast<std::uint8_t>(role));
   append_u8(out, static_cast<std::uint8_t>(dependency));
-  append_u64(out, evidence_generation.value());
-  // created_at and created_epoch are process-local bookkeeping, excluded so
-  // that insertion order cannot change the semantic digest.
+  // evidence_generation, created_at and created_epoch are process-local
+  // bookkeeping, excluded so that arrival order cannot change the semantic
+  // digest.
   append_bytes(out, superseded_by.to_string());
   append_bytes(out, supersedes.to_string());
   append_bytes(out, provenance.canonical_form());
   append_bytes(out, derivation.rule.to_string());
-  append_u64(out, derivation.generation.value());
+  // derivation.generation is the registry generation the pass ran at, which is
+  // process-local. The source identities and source generations below are the
+  // semantic part of the derivation.
   append_bytes(out, derivation.context);
   append_u8(out, derivation.valid ? 1 : 0);
   append_u32(out, static_cast<std::uint32_t>(derivation.sources.size()));

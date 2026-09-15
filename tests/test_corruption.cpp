@@ -1315,32 +1315,28 @@ FDR_TEST_CASE(corruption, two_mutations_this_build_accepts_are_pinned) {
   FDR_CHECK_EQ(membership_ids.size(), std::size_t{2});
   const MembershipId first_id = membership_ids[0];
 
-  // (1) A membership bound to a generation the domain never had. decode_payload
-  // checks that the domain exists and that the generation is non-zero, but never
-  // that the generation is one the domain actually had, so this image loads and
-  // validate_state() does not notice. That is a real hole in the loader, and it is
-  // reported rather than papered over.
+  // (1) A membership bound to a generation the domain never had. The loader now
+  // rejects it: a generation above the domain's current one could never have been
+  // produced by this runtime, so the image is not a state this registry could
+  // have written.
   {
     std::string image = payload;
     write_u64(image, membership.domain_generation, 4242u);
     FDR_CHECK_MSG(spit(path, build_container(image)), "the image could not be written");
     Registry registry(RegistryLimits::defaults());
     const Outcome outcome = registry.load(config_for(path));
-    FDR_CHECK_EQ(outcome.code, OutcomeCode::Committed);
-    FDR_CHECK_EQ(registry.membership_count(), std::size_t{2});
-    const auto record = registry.membership(first_id);
-    FDR_CHECK(record.has_value());
-    FDR_CHECK_EQ(record->domain_generation.value(), std::uint64_t{4242});
-    FDR_CHECK(registry.domain(record->domain).has_value());
-    FDR_CHECK(!(registry.domain(record->domain)->generation.value() == std::uint64_t{4242}));
+    FDR_CHECK_EQ(outcome.code, OutcomeCode::IntegrityFailure);
+    FDR_CHECK(outcome.message.find("domain generation that never existed") != std::string::npos);
+    FDR_CHECK_EQ(registry.membership_count(), std::size_t{0});
     std::string why;
     FDR_CHECK_MSG(registry.validate_state(&why),
                   "validate_state rejected the mis-bound membership: " + why);
   }
 
-  // (2) A cycle over an acyclic relation type. decode_payload does not re-check
-  // acyclicity, so the image loads; validate_state() then reports the cycle,
-  // which is the documented consistency check.
+  // (2) A cycle over an acyclic relation type. The loader now re-checks
+  // acyclicity per relation type exactly as the runtime applies it, so the image
+  // is rejected instead of loading into a state the registry could never have
+  // produced.
   {
     std::string image = duplicate_record(payload, relation.span, relation_count);
     const RelationOffsets duplicate = relation_offsets(image, 1);
@@ -1355,13 +1351,10 @@ FDR_TEST_CASE(corruption, two_mutations_this_build_accepts_are_pinned) {
     FDR_CHECK_MSG(spit(path, build_container(image)), "the image could not be written");
     Registry registry(RegistryLimits::defaults());
     const Outcome outcome = registry.load(config_for(path));
-    FDR_CHECK_EQ(outcome.code, OutcomeCode::Committed);
-    FDR_CHECK_EQ(registry.relations_of(fixture.rack).size(), std::size_t{2});
-    std::string why;
-    FDR_CHECK_MSG(!registry.validate_state(&why),
-                  "validate_state accepted a cycle over an acyclic relation type");
-    FDR_CHECK(why.find("cycle") != std::string::npos);
-    FDR_CHECK_EQ(registry.domain_count(), std::size_t{4});
+    FDR_CHECK_EQ(outcome.code, OutcomeCode::IntegrityFailure);
+    FDR_CHECK(outcome.message.find("cycle over an acyclic relation type") != std::string::npos);
+    FDR_CHECK_EQ(registry.domain_count(), std::size_t{0});
+    FDR_CHECK_EQ(registry.relations_of(fixture.rack).size(), std::size_t{0});
   }
 }
 

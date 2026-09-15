@@ -251,6 +251,32 @@ Outcome PublisherClient::create_domain(const CreateDomainRequest& request) {
   return response_to_outcome(response, nullptr);
 }
 
+Outcome PublisherClient::update_domain(const UpdateDomainRequest& request) {
+  const std::lock_guard<std::mutex> guard(impl_->mutex);
+  WireRequest wire;
+  wire.op = Operation::UpdateDomain;
+  wire.update_domain = request;
+  wire.authority = authority_of(impl_->config, impl_->epoch, request.attempt,
+                                request.provenance.evidence);
+  std::string payload;
+  Outcome result = encode_wire_request(wire, &payload);
+  if (!result.committed()) {
+    return result;
+  }
+  std::string response_payload;
+  result = send_request(MessageType::Mutate, payload, &response_payload);
+  if (!result.committed()) {
+    return result;
+  }
+  WireResponse response;
+  result = decode_wire_response(response_payload, &response);
+  if (!result.committed()) {
+    return result;
+  }
+  impl_->generation = response.generation;
+  return response_to_outcome(response, nullptr);
+}
+
 Outcome PublisherClient::attach_member(const AttachMemberRequest& request) {
   WireRequest wire;
   wire.op = Operation::AttachMember;

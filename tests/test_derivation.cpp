@@ -1222,9 +1222,11 @@ FDR_TEST_CASE(derivation, a_derived_membership_is_never_published_or_withdrawn_d
   withdraw.membership = derived->id;
   withdraw.reason = "derivation-suite";
   const Outcome refused = fixture.registry->withdraw_evidence(withdraw);
-  FDR_CHECK_EQ(refused.code, OutcomeCode::Idempotent);
-  FDR_CHECK(refused.message.find("no matching evidence") != std::string::npos);
-  FDR_CHECK(!(refused.code == OutcomeCode::PolicyRejected));
+  // The guard is evaluated before the evidence match, so it is reachable: a
+  // derived membership is withdrawn by invalidating its sources, never by an
+  // evidence withdrawal, and the answer is a refusal rather than a no-op.
+  FDR_CHECK_EQ(refused.code, OutcomeCode::PolicyRejected);
+  FDR_CHECK(refused.message.find("invalidating its sources") != std::string::npos);
   FDR_CHECK(fixture.registry->generation() == generation);
   const std::optional<Membership> after = fixture.registry->membership(derived->id);
   FDR_CHECK(after.has_value());

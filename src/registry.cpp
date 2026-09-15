@@ -16,6 +16,32 @@ namespace {
 
 std::string class_key(const DomainClassRef& value) { return value.to_string(); }
 
+} // namespace
+
+/// Every publisher that owns evidence on this membership, headline included.
+/// The index is keyed on ownership, not on the headline provenance, so a record
+/// whose headline moved to a stronger publisher is still reachable from the
+/// weaker incarnation that attested it.
+std::vector<PublisherId> membership_evidence_publishers(const Membership& record) {
+  std::vector<PublisherId> publishers;
+  if (record.provenance.has_publisher()) {
+    publishers.push_back(record.provenance.publisher);
+  }
+  for (const MembershipEvidence& entry : record.evidence) {
+    if (!entry.provenance.has_publisher()) {
+      continue;
+    }
+    if (std::find(publishers.begin(), publishers.end(), entry.provenance.publisher) ==
+        publishers.end()) {
+      publishers.push_back(entry.provenance.publisher);
+    }
+  }
+  std::sort(publishers.begin(), publishers.end());
+  return publishers;
+}
+
+namespace {
+
 template <class T>
 void erase_value(std::vector<T>& values, const T& value) {
   values.erase(std::remove(values.begin(), values.end(), value), values.end());
@@ -125,8 +151,8 @@ void Registry::Impl::unindex_domain(const FailureDomain& record) {
 void Registry::Impl::index_membership(const Membership& record) {
   state.by_entity[record.member.id()].push_back(record.id);
   state.by_domain[record.domain].push_back(record.id);
-  if (record.provenance.has_publisher()) {
-    state.by_publisher[record.provenance.publisher].push_back(record.id);
+  for (const PublisherId& publisher : membership_evidence_publishers(record)) {
+    state.by_publisher[publisher].push_back(record.id);
   }
   const auto slot = static_cast<std::size_t>(record.lifecycle);
   if (slot < kLifecycleSlots) {
@@ -149,8 +175,8 @@ void Registry::Impl::unindex_membership(const Membership& record) {
       state.by_domain.erase(domain_it);
     }
   }
-  if (record.provenance.has_publisher()) {
-    const auto publisher_it = state.by_publisher.find(record.provenance.publisher);
+  for (const PublisherId& publisher : membership_evidence_publishers(record)) {
+    const auto publisher_it = state.by_publisher.find(publisher);
     if (publisher_it != state.by_publisher.end()) {
       erase_value(publisher_it->second, record.id);
       if (publisher_it->second.empty()) {
@@ -207,6 +233,18 @@ void Registry::Impl::unindex_relation(const DomainRelation& record) {
 }
 
 void Registry::Impl::store_domain(FailureDomain record) {
+  // A history entry appended during this mutation describes the change that is
+  // being committed, so it is finalised with the generation and lifecycle the
+  // change produced rather than the ones it replaced.
+  if (!record.history.empty()) {
+    DomainHistoryEntry& last = record.history.back();
+    if (last.at == state.generation && last.generation != record.generation) {
+      last.generation = record.generation;
+      last.lifecycle = record.lifecycle;
+      last.evidence = record.provenance.evidence;
+      last.epoch = state.epoch;
+    }
+  }
   const auto existing = state.domains.find(record.id);
   if (existing != state.domains.end()) {
     unindex_domain(*existing->second);
@@ -216,6 +254,15 @@ void Registry::Impl::store_domain(FailureDomain record) {
 }
 
 void Registry::Impl::store_membership(Membership record) {
+  if (!record.history.empty()) {
+    MembershipHistoryEntry& last = record.history.back();
+    if (last.at == state.generation && last.generation != record.generation) {
+      last.generation = record.generation;
+      last.lifecycle = record.lifecycle;
+      last.evidence = record.provenance.evidence;
+      last.epoch = state.epoch;
+    }
+  }
   const auto existing = state.memberships.find(record.id);
   if (existing != state.memberships.end()) {
     unindex_membership(*existing->second);
@@ -244,8 +291,11 @@ void Registry::Impl::push_domain_history(FailureDomain& record, std::string caus
   entry.lifecycle = record.lifecycle;
   entry.cause = std::move(cause);
   entry.evidence = record.provenance.evidence;
-  entry.epoch = record.created_epoch;
-  entry.at = record.created_at;
+  // "at" is the registry generation the change happens in, and store_domain
+  // finalises the entry with the post-change values once the caller has applied
+  // them, so history always describes the state a change produced.
+  entry.epoch = state.epoch;
+  entry.at = state.generation;
   record.history.push_back(std::move(entry));
   if (max_entries > 0 && record.history.size() > max_entries) {
     const std::size_t drop = record.history.size() - max_entries;
@@ -261,8 +311,8 @@ void Registry::Impl::push_membership_history(Membership& record, std::string cau
   entry.lifecycle = record.lifecycle;
   entry.cause = std::move(cause);
   entry.evidence = record.provenance.evidence;
-  entry.epoch = record.created_epoch;
-  entry.at = record.created_at;
+  entry.epoch = state.epoch;
+  entry.at = state.generation;
   record.history.push_back(std::move(entry));
   if (max_entries > 0 && record.history.size() > max_entries) {
     const std::size_t drop = record.history.size() - max_entries;
@@ -499,6 +549,86 @@ Outcome Registry::Impl::check_domain_limits() const {
         .field_step("commit", "max_domains", std::to_string(limits.max_domains), "limit reached");
   }
   return Outcome::make(OutcomeCode::Committed, "within limits");
+}
+
+namespace {
+
+Outcome record_size_outcome(std::size_t encoded_bytes, std::size_t limit) {
+  if (encoded_bytes > limit) {
+    return Outcome::make(OutcomeCode::ResourceLimit,
+                         "the record exceeds max_record_bytes once encoded")
+        .field_step("commit", "max_record_bytes", std::to_string(limit),
+                    "encoded size is " + std::to_string(encoded_bytes));
+  }
+  return Outcome::make(OutcomeCode::Committed, "record size accepted");
+}
+
+} // namespace
+
+Outcome Registry::Impl::check_record_size(const FailureDomain& record) const {
+  return record_size_outcome(encoded_domain_bytes(record), limits.max_record_bytes);
+}
+
+Outcome Registry::Impl::check_record_size(const Membership& record) const {
+  return record_size_outcome(encoded_membership_bytes(record), limits.max_record_bytes);
+}
+
+Outcome Registry::Impl::check_record_size(const DomainRelation& record) const {
+  return record_size_outcome(encoded_relation_bytes(record), limits.max_record_bytes);
+}
+
+std::size_t Registry::Impl::hierarchy_depth_above(const FailureDomainId& id) const {
+  std::vector<FailureDomainId> frontier{id};
+  std::set<FailureDomainId> seen;
+  seen.insert(id);
+  std::size_t depth = 0;
+  while (!frontier.empty() && depth <= limits.max_hierarchy_depth) {
+    std::vector<FailureDomainId> next;
+    for (const FailureDomainId& current : frontier) {
+      const auto it = state.parents.find(current);
+      if (it == state.parents.end()) {
+        continue;
+      }
+      for (const FailureDomainId& parent : it->second) {
+        if (seen.insert(parent).second) {
+          next.push_back(parent);
+        }
+      }
+    }
+    if (next.empty()) {
+      break;
+    }
+    ++depth;
+    frontier.swap(next);
+  }
+  return depth;
+}
+
+std::size_t Registry::Impl::hierarchy_depth_below(const FailureDomainId& id) const {
+  std::vector<FailureDomainId> frontier{id};
+  std::set<FailureDomainId> seen;
+  seen.insert(id);
+  std::size_t depth = 0;
+  while (!frontier.empty() && depth <= limits.max_hierarchy_depth) {
+    std::vector<FailureDomainId> next;
+    for (const FailureDomainId& current : frontier) {
+      const auto it = state.children.find(current);
+      if (it == state.children.end()) {
+        continue;
+      }
+      for (const FailureDomainId& child : it->second) {
+        if (seen.insert(child).second) {
+          next.push_back(child);
+        }
+      }
+    }
+    if (next.empty()) {
+      break;
+    }
+    ++depth;
+    frontier.swap(next);
+  }
+  return depth;
 }
 
 Outcome Registry::Impl::check_membership_limits() const {

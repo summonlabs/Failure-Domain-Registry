@@ -58,12 +58,18 @@ bool is_valid_segment(std::string_view text, std::size_t max_bytes) noexcept {
   if (text.empty() || text.size() > max_bytes) {
     return false;
   }
+  bool has_non_dot = false;
   for (char c : text) {
     if (!is_extension_char(c)) {
       return false;
     }
+    if (c != '.') {
+      has_non_dot = true;
+    }
   }
-  return true;
+  // "." and ".." are path components, not namespace or name components, and a
+  // segment made only of dots is never a meaningful extension.
+  return has_non_dot;
 }
 
 } // namespace

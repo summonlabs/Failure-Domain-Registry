@@ -160,6 +160,7 @@ std::string_view to_string(Operation value) noexcept {
     case Operation::SupersedeDomain: return "supersede-domain";
     case Operation::RetireDomain: return "retire-domain";
     case Operation::AttachMember: return "attach-member";
+    case Operation::UpdateDomain: return "update-domain";
     case Operation::PublishMemberships: return "publish-memberships";
     case Operation::WithdrawEvidence: return "withdraw-evidence";
     case Operation::DeclareCoverage: return "declare-coverage";
@@ -203,6 +204,7 @@ bool is_valid_operation(Operation value) noexcept {
     case Operation::QueryIndependence:
     case Operation::QuerySnapshot:
     case Operation::QueryExplainMembership:
+    case Operation::UpdateDomain:
     case Operation::Response:
       return true;
     default:
@@ -221,6 +223,7 @@ bool is_mutation_operation(Operation value) noexcept {
     case Operation::DeclareCoverage:
     case Operation::InvalidateEntity:
     case Operation::RunDerivation:
+    case Operation::UpdateDomain:
       return true;
     default:
       return false;
@@ -279,6 +282,16 @@ Outcome encode_wire_request(const WireRequest& request, std::string* payload) {
       writer.u8(static_cast<std::uint8_t>(body.kind));
       writer.u8(static_cast<std::uint8_t>(body.role));
       writer.u8(static_cast<std::uint8_t>(body.dependency));
+      write_provenance(writer, body.provenance);
+      break;
+    }
+    case Operation::UpdateDomain: {
+      write_authority(writer, request.authority);
+      const UpdateDomainRequest& body = request.update_domain;
+      writer.bytes(body.domain.to_string());
+      writer.u64(body.expected_generation.value());
+      writer.u8(body.transition.has_value() ? static_cast<std::uint8_t>(*body.transition) : 0);
+      writer.bytes(body.name.has_value() ? *body.name : std::string());
       write_provenance(writer, body.provenance);
       break;
     }
@@ -558,6 +571,30 @@ Outcome decode_wire_request(std::string_view payload, WireRequest* request) {
       body.kind = static_cast<MembershipKind>(kind);
       body.role = static_cast<MembershipRole>(role);
       body.dependency = static_cast<DependencySemantics>(dependency);
+      break;
+    }
+    case Operation::UpdateDomain: {
+      UpdateDomainRequest& body = request->update_domain;
+      std::uint8_t transition = 0;
+      std::string name;
+      if (!read_authority(reader, &request->authority) || !read_domain_id(reader, &body.domain) ||
+          !reader.u64(&counter)) {
+        return malformed();
+      }
+      body.expected_generation = FailureDomainGeneration(counter);
+      if (!reader.u8(&transition) || !reader.bytes(&name, kMaxWireString) ||
+          !read_provenance(reader, &body.provenance)) {
+        return malformed();
+      }
+      if (transition != 0) {
+        if (!is_valid_domain_lifecycle(static_cast<DomainLifecycle>(transition))) {
+          return malformed();
+        }
+        body.transition = static_cast<DomainLifecycle>(transition);
+      }
+      if (!name.empty()) {
+        body.name = std::move(name);
+      }
       break;
     }
     case Operation::PublishMemberships: {

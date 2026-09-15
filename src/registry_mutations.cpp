@@ -120,12 +120,40 @@ AuthorityContext with_evidence(const AuthorityContext& authority, EvidenceClass 
 
 enum class Precedence { Stronger, Weaker, EqualSameSource, EqualDifferentSource };
 
+/// True when two provenances are the same attestation. The worker boot and the
+/// per-registry evidence counter are deliberately ignored: re-publishing the
+/// same fact, from the same authority and source, is the same attestation no
+/// matter which incarnation said it or how many facts preceded it.
+bool same_attestation(const Provenance& left, const Provenance& right) {
+  return left.source == right.source && left.evidence == right.evidence &&
+         left.truth == right.truth && left.publisher == right.publisher &&
+         left.source_identity == right.source_identity;
+}
+
+/// Deterministic precedence between an existing and an incoming provenance.
+///
+/// Two authorities disagreeing at equal strength is a conflict. One authority
+/// re-attesting its own classification is not a disagreement, so a publisher may
+/// replace its own earlier provenance - including from a previous incarnation -
+/// as long as it does not weaken the evidence class. That is what makes
+/// re-attestation of a REVALIDATION_REQUIRED record possible without inventing a
+/// second authority.
 Precedence compare_provenance(const Provenance& existing, const Provenance& incoming) {
-  if (evidence_outranks(incoming.evidence, existing.evidence)) {
-    return Precedence::Stronger;
-  }
   if (evidence_outranks(existing.evidence, incoming.evidence)) {
     return Precedence::Weaker;
+  }
+  // Same authority *and* same source: one publisher restating the fact it took
+  // from the same place. That is a replacement, not a disagreement, whatever
+  // incarnation said it. A different source cited by the same authority is still
+  // two claims about where the truth comes from, so it falls through to the rank
+  // comparison and can be a genuine tie.
+  const bool same_authority = existing.has_publisher() && incoming.has_publisher() &&
+                              existing.publisher == incoming.publisher;
+  if (same_authority && existing.source == incoming.source) {
+    return Precedence::Stronger;
+  }
+  if (evidence_outranks(incoming.evidence, existing.evidence)) {
+    return Precedence::Stronger;
   }
   if (incoming.source == existing.source && incoming.source_identity == existing.source_identity &&
       incoming.truth == existing.truth) {
@@ -476,7 +504,7 @@ Outcome Registry::create_domain(const CreateDomainRequest& request) {
       return impl_->record(std::move(outcome));
     }
     const Precedence precedence = compare_provenance(existing->provenance, provenance);
-    const bool identical = precedence == Precedence::EqualSameSource &&
+    const bool identical = same_attestation(existing->provenance, provenance) &&
                            existing->name == request.name &&
                            existing->administrative_scope == request.administrative_scope &&
                            existing->metadata == request.metadata &&
@@ -532,6 +560,11 @@ Outcome Registry::create_domain(const CreateDomainRequest& request) {
     if (next.has_value()) {
       record.generation = *next;
     }
+  if (const Outcome size_check = impl_->check_record_size(record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
     impl_->store_domain(std::move(record));
     impl_->bump_generation();
     Outcome outcome = Outcome::make(OutcomeCode::Committed,
@@ -562,6 +595,11 @@ Outcome Registry::create_domain(const CreateDomainRequest& request) {
   record.created_at = impl_->state.generation;
   record.created_epoch = impl_->state.epoch;
   record.metadata = request.metadata;
+  if (const Outcome size_check = impl_->check_record_size(record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   impl_->store_domain(std::move(record));
   impl_->bump_generation();
   Outcome outcome = Outcome::make(OutcomeCode::Committed, "domain created");
@@ -720,6 +758,11 @@ Outcome Registry::update_domain(const UpdateDomainRequest& request) {
     return impl_->record(std::move(outcome));
   }
   record.generation = *next;
+  if (const Outcome size_check = impl_->check_record_size(record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   impl_->store_domain(std::move(record));
   impl_->bump_generation();
   Outcome outcome = Outcome::make(OutcomeCode::Committed, "domain updated");
@@ -796,10 +839,21 @@ Outcome Registry::supersede_domain(const SupersedeDomainRequest& request) {
     updated.generation = *next;
   }
   const DomainLifecycle previous_lifecycle = domain->lifecycle;
+  if (const Outcome size_check = impl_->check_record_size(updated); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   impl_->store_domain(std::move(updated));
 
   FailureDomain successor_record = *successor;
   successor_record.supersedes = request.domain;
+  if (const Outcome size_check = impl_->check_record_size(successor_record);
+      !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   impl_->store_domain(std::move(successor_record));
 
   if (request.demote_memberships) {
@@ -879,6 +933,11 @@ Outcome Registry::retire_domain(const RetireDomainRequest& request) {
   const std::optional<FailureDomainGeneration> next = updated.generation.next();
   if (next.has_value()) {
     updated.generation = *next;
+  }
+  if (const Outcome size_check = impl_->check_record_size(updated); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
   }
   impl_->store_domain(std::move(updated));
   if (request.retire_memberships) {
@@ -960,6 +1019,20 @@ Outcome Registry::add_relation(const AddRelationRequest& request) {
       return impl_->record(std::move(outcome));
     }
   }
+  if (request.type == DomainRelationType::ContainedBy) {
+    const std::size_t depth = impl_->hierarchy_depth_above(request.target) + 1 +
+                              impl_->hierarchy_depth_below(request.source);
+    if (depth > impl_->limits.max_hierarchy_depth) {
+      Outcome outcome = Outcome::make(
+          OutcomeCode::InvalidHierarchy,
+          "the containment edge would make the hierarchy deeper than max_hierarchy_depth");
+      outcome.field_step("hierarchy", "max_hierarchy_depth",
+                         std::to_string(impl_->limits.max_hierarchy_depth),
+                         "resulting depth is " + std::to_string(depth));
+      outcome.request_digest = digest;
+      return impl_->record(std::move(outcome));
+    }
+  }
   const DomainRelationId id = relation_id_for(request.source, request.target, request.type);
   if (impl_->state.relations.find(id) != impl_->state.relations.end()) {
     Outcome outcome = Outcome::make(OutcomeCode::Idempotent, "the relation already exists");
@@ -1004,6 +1077,11 @@ Outcome Registry::add_relation(const AddRelationRequest& request) {
   record.provenance = provenance;
   record.created_at = impl_->state.generation;
   record.created_epoch = impl_->state.epoch;
+  if (const Outcome size_check = impl_->check_record_size(record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   impl_->store_relation(std::move(record));
   impl_->bump_generation();
   Outcome outcome = Outcome::make(OutcomeCode::Committed, "relation created");
@@ -1163,6 +1241,11 @@ Outcome Registry::merge_domains(const MergeDomainsRequest& request) {
   if (next_absorbed.has_value()) {
     absorbed_record.generation = *next_absorbed;
   }
+  if (const Outcome size_check = impl_->check_record_size(absorbed_record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   impl_->store_domain(std::move(absorbed_record));
   impl_->bump_generation();
   Outcome outcome = Outcome::make(OutcomeCode::Committed, "domains merged");
@@ -1320,6 +1403,11 @@ Outcome Registry::attach_member(const AttachMemberRequest& request) {
     record.created_at = impl_->state.generation;
     record.created_epoch = impl_->state.epoch;
     record.metadata = request.metadata;
+  if (const Outcome size_check = impl_->check_record_size(record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
     impl_->store_membership(std::move(record));
     impl_->bump_generation();
     Outcome outcome = Outcome::make(OutcomeCode::Committed, "member attached");
@@ -1338,8 +1426,11 @@ Outcome Registry::attach_member(const AttachMemberRequest& request) {
     return impl_->record(std::move(outcome));
   }
   const Precedence precedence = compare_provenance(existing->provenance, provenance);
-  const bool identical = precedence == Precedence::EqualSameSource &&
-                         existing->role == request.role &&
+  // An exact re-publication of something already current is idempotent; a
+  // re-publication of something that is not current is an update, so that a
+  // revalidation is always observable as a committed change.
+  const bool identical = same_attestation(existing->provenance, provenance) &&
+                         existing->is_current() && existing->role == request.role &&
                          existing->dependency == request.dependency &&
                          existing->domain_generation == domain->generation &&
                          existing->metadata == request.metadata;
@@ -1417,6 +1508,11 @@ Outcome Registry::attach_member(const AttachMemberRequest& request) {
   const std::optional<MembershipGeneration> next = record.generation.next();
   if (next.has_value()) {
     record.generation = *next;
+  }
+  if (const Outcome size_check = impl_->check_record_size(record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
   }
   impl_->store_membership(std::move(record));
   impl_->bump_generation();
@@ -1638,6 +1734,11 @@ Outcome Registry::replace_membership(const ReplaceMembershipRequest& request) {
     return impl_->record(std::move(outcome));
   }
   record.generation = *next;
+  if (const Outcome size_check = impl_->check_record_size(record); !size_check.committed()) {
+    Outcome outcome = size_check;
+    outcome.request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   impl_->store_membership(std::move(record));
   impl_->bump_generation();
   Outcome outcome = Outcome::make(OutcomeCode::Committed, "membership replaced");
@@ -1934,6 +2035,33 @@ Outcome Registry::publish_memberships(const MembershipBatchRequest& request) {
     prepared.push_back(std::move(item));
   }
 
+  // The publication is bounded as a whole before anything is applied.
+  {
+    std::size_t new_records = 0;
+    for (const Prepared& item : prepared) {
+      if (const Outcome size_check = impl_->check_record_size(item.record);
+          !size_check.committed()) {
+        Outcome outcome = size_check;
+        outcome.request_digest = digest;
+        return impl_->record(std::move(outcome));
+      }
+      if (item.is_new) {
+        ++new_records;
+      }
+    }
+    if (impl_->state.memberships.size() + new_records > impl_->limits.max_memberships) {
+      Outcome outcome = Outcome::make(
+          OutcomeCode::ResourceLimit,
+          "the publication would exceed max_memberships");
+      outcome.field_step("limit", "max_memberships",
+                         std::to_string(impl_->limits.max_memberships),
+                         "current " + std::to_string(impl_->state.memberships.size()) + " plus " +
+                             std::to_string(new_records) + " new records");
+      outcome.request_digest = digest;
+      return impl_->record(std::move(outcome));
+    }
+  }
+
   // --- commit phase: the whole publication is applied or none of it is -----
   std::size_t added = 0;
   std::size_t updated = 0;
@@ -2052,6 +2180,13 @@ Outcome Registry::withdraw_evidence(const WithdrawEvidenceRequest& request) {
       return impl_->record(std::move(outcome));
     }
   }
+  if (existing->kind == MembershipKind::Derived) {
+    Outcome outcome = Outcome::make(
+        OutcomeCode::PolicyRejected,
+        "derived membership is withdrawn by invalidating its sources, not by evidence withdrawal");
+    outcome.with_membership(request.membership).request_digest = digest;
+    return impl_->record(std::move(outcome));
+  }
   bool matched = false;
   for (const MembershipEvidence& entry : existing->evidence) {
     const bool same_publisher = entry.provenance.publisher == request.authority.publisher;
@@ -2072,15 +2207,8 @@ Outcome Registry::withdraw_evidence(const WithdrawEvidenceRequest& request) {
     outcome.request_digest = digest;
     return impl_->record(std::move(outcome));
   }
-  if (existing->kind == MembershipKind::Derived) {
-    Outcome outcome = Outcome::make(
-        OutcomeCode::PolicyRejected,
-        "derived membership is withdrawn by invalidating its sources, not by evidence withdrawal");
-    outcome.with_membership(request.membership).request_digest = digest;
-    return impl_->record(std::move(outcome));
-  }
   impl_->withdraw_publisher_evidence(request.authority.publisher, request.authority.worker_boot,
-                                     request.only_this_worker_boot, request.evidence,
+                                     request.only_this_worker_boot, request.evidence, false,
                                      MembershipLifecycle::RevalidationRequired,
                                      request.reason.empty() ? "evidence withdrawn" : request.reason);
   impl_->bump_generation();

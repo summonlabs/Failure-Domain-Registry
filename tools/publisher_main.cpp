@@ -203,6 +203,18 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         continue;
       }
+    } else if (command == "reattest" && tokens.size() >= 2) {
+      UpdateDomainRequest request;
+      request.attempt = attempt;
+      request.provenance = base_provenance(config.label, evidence);
+      const std::optional<FailureDomainId> domain = FailureDomainId::parse(tokens[1]);
+      if (!domain.has_value()) {
+        outcome = Outcome::make(OutcomeCode::MalformedRequest, "malformed domain id");
+      } else {
+        request.domain = *domain;
+        request.transition = DomainLifecycle::Current;
+        outcome = client.update_domain(request);
+      }
     } else if (command == "attach" && tokens.size() >= 3) {
       AttachMemberRequest request;
       request.attempt = attempt;

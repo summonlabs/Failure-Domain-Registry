@@ -31,6 +31,8 @@ enum class Operation : std::uint16_t {
   SupersedeDomain = 11,
   RetireDomain = 12,
   AttachMember = 13,
+  /// Re-attest a domain: name, metadata, evidence and lifecycle transition.
+  UpdateDomain = 14,
   PublishMemberships = 20,
   WithdrawEvidence = 21,
   DeclareCoverage = 22,
@@ -66,6 +68,7 @@ struct WireRequest {
   std::string label;
   CreateDomainRequest create_domain{};
   AttachMemberRequest attach_member{};
+  UpdateDomainRequest update_domain{};
   MembershipBatchRequest publish{};
   WithdrawEvidenceRequest withdraw{};
   SupersedeDomainRequest supersede{};

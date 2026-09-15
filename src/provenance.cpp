@@ -136,7 +136,8 @@ std::string Provenance::canonical_form() const {
   append_u8(out, static_cast<std::uint8_t>(truth));
   append_bytes(out, publisher.to_string());
   append_bytes(out, worker_boot.to_string());
-  append_u64(out, evidence_generation.value());
+  // evidence_generation is drawn from one per-registry counter, so including it
+  // would make the semantic digest depend on the order facts arrived in.
   append_bytes(out, source_identity);
   append_bytes(out, derivation_rule.to_string());
   append_bytes(out, derivation_context);

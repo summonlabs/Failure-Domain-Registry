@@ -35,7 +35,7 @@ bool coverage_less(const CoverageDeclaration& left, const CoverageDeclaration& r
 
 } // namespace
 
-StateDigest Registry::Impl::compute_state_digest() const {
+StateDigest compute_state_digest_of(const RegistryState& state) {
   Sha256 hasher;
   std::string canonical;
   append_bytes(canonical, "fdr/state/v1");
@@ -84,6 +84,10 @@ StateDigest Registry::Impl::compute_state_digest() const {
     absorb(form);
   }
   return StateDigest::from_bytes(hasher.finish());
+}
+
+StateDigest Registry::Impl::compute_state_digest() const {
+  return compute_state_digest_of(state);
 }
 
 StateDigest Registry::state_digest() const {
@@ -455,8 +459,8 @@ bool Registry::validate_state(std::string* why) const {
     }
     by_entity[record.member.id()].push_back(record.id);
     by_domain[record.domain].push_back(record.id);
-    if (record.provenance.has_publisher()) {
-      by_publisher[record.provenance.publisher].push_back(record.id);
+    for (const PublisherId& publisher : membership_evidence_publishers(record)) {
+      by_publisher[publisher].push_back(record.id);
     }
     const auto slot = static_cast<std::size_t>(record.lifecycle);
     if (slot < kLifecycleSlots) {
@@ -708,9 +712,15 @@ Explanation Registry::explain_domain(const FailureDomainId& id) const {
     explanation.field_step("lineage", "merged-into", record->merged_into.to_string(),
                            "surviving domain of an explicit merge");
   }
-  for (const DomainHistoryEntry& entry : record->history) {
-    explanation.field_step("history", entry.cause, entry.generation.to_string(),
-                           std::string(to_string(entry.lifecycle)));
+  std::size_t emitted = 0;
+  for (auto it = record->history.rbegin();
+       it != record->history.rend() && emitted < impl_->limits.max_history_query; ++it, ++emitted) {
+    explanation.field_step("history", it->cause, it->generation.to_string(),
+                           std::string(to_string(it->lifecycle)));
+  }
+  if (record->history.size() > emitted) {
+    explanation.field_step("history", "truncated", std::to_string(record->history.size() - emitted),
+                           "max_history_query reached; older entries are not rendered");
   }
   return explanation;
 }
@@ -762,9 +772,17 @@ Explanation Registry::explain_membership(const FailureDomainId& domain,
                              std::to_string(record.derivation.sources.size()),
                              record.derivation.context);
     }
-    for (const MembershipHistoryEntry& entry : record.history) {
-      explanation.field_step("history", entry.cause, entry.generation.to_string(),
-                             std::string(to_string(entry.lifecycle)));
+    std::size_t emitted = 0;
+    for (auto entry_it = record.history.rbegin();
+         entry_it != record.history.rend() && emitted < impl_->limits.max_history_query;
+         ++entry_it, ++emitted) {
+      explanation.field_step("history", entry_it->cause, entry_it->generation.to_string(),
+                             std::string(to_string(entry_it->lifecycle)));
+    }
+    if (record.history.size() > emitted) {
+      explanation.field_step("history", "truncated",
+                             std::to_string(record.history.size() - emitted),
+                             "max_history_query reached; older entries are not rendered");
     }
   }
   if (!found) {

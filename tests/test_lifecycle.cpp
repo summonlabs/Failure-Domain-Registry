@@ -733,9 +733,11 @@ FDR_TEST_CASE(lifecycle, candidate_revalidates_back_to_current) {
   FDR_CHECK(current->is_current());
   FDR_CHECK_EQ(current->generation.value(), std::uint64_t{2});
   FDR_CHECK_EQ(current->created_generation.value(), std::uint64_t{1});
-  // The lineage records the state the record left, not the one it entered.
+  // The lineage records the state the change produced, and the generation it
+  // came from in previous_generation.
   FDR_CHECK_EQ(current->history.size(), std::size_t{1});
-  FDR_CHECK_EQ(current->history.back().lifecycle, DomainLifecycle::Candidate);
+  FDR_CHECK_EQ(current->history.back().lifecycle, DomainLifecycle::Current);
+  FDR_CHECK_EQ(current->history.back().previous_generation.value(), std::uint64_t{1});
   FDR_CHECK_EQ(current->history.back().cause, std::string("transition:CURRENT"));
   handle = handle_of(*current);
 
@@ -751,7 +753,7 @@ FDR_TEST_CASE(lifecycle, candidate_revalidates_back_to_current) {
   FDR_CHECK(failure_domain_registry::is_indeterminate(revalidating->lifecycle));
   FDR_CHECK_EQ(revalidating->generation.value(), std::uint64_t{3});
   FDR_CHECK_EQ(revalidating->history.size(), std::size_t{2});
-  FDR_CHECK_EQ(revalidating->history.back().lifecycle, DomainLifecycle::Current);
+  FDR_CHECK_EQ(revalidating->history.back().lifecycle, DomainLifecycle::RevalidationRequired);
   FDR_CHECK_EQ(revalidating->history.back().cause, std::string("transition:REVALIDATION_REQUIRED"));
   handle = handle_of(*revalidating);
 

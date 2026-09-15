@@ -657,9 +657,9 @@ FDR_TEST_CASE(domain, equal_rank_from_a_different_source_marks_the_domain_confli
     FDR_CHECK_EQ(created.code, OutcomeCode::Committed);
     const RegistryGeneration after_create = fixture.registry.generation();
 
-    // Equally strong statements from two different sources disagree: neither
-    // wins, so the record becomes indeterminate rather than silently picking
-    // one.
+    // Equally strong statements that cite different sources disagree, even when
+    // one authority relays both: the registry does not pick a winner, so the
+    // record becomes indeterminate.
     const Provenance power = provenance_of(ProvenanceSource::PowerManagement, EvidenceClass::AdministrativeDeclaration,
                                            TruthClass::Real, "pm-1");
     const Outcome conflicted = create_now(fixture, 2u, DomainClass::Rack, "dc1", "rack-r7", "Rack R7 (renamed)", power);
@@ -783,7 +783,7 @@ FDR_TEST_CASE(domain, update_domain_applies_evidence_precedence) {
     FDR_CHECK_EQ(upgraded.domain_generation->value(), std::uint64_t{2});
     FDR_CHECK_EQ(fixture.registry.generation().value(), std::uint64_t{5});
 
-    // An equally strong statement from another source is a conflict, and the
+    // An equally strong statement citing another source is a conflict, and the
     // update path refuses it without changing the record's lifecycle.
     UpdateDomainRequest rival;
     rival.attempt = attempt_with(5u);

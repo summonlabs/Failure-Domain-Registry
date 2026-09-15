@@ -64,6 +64,9 @@ public:
   const PublisherClientConfig& config() const noexcept;
 
   Outcome create_domain(const CreateDomainRequest& request);
+  /// Re-attest a domain: restore authority after a revalidation demand, update
+  /// its name or metadata, or move its lifecycle along a legal transition.
+  Outcome update_domain(const UpdateDomainRequest& request);
   Outcome supersede_domain(const SupersedeDomainRequest& request);
   Outcome retire_domain(const RetireDomainRequest& request);
   Outcome attach_member(const AttachMemberRequest& request);

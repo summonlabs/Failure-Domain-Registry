@@ -1318,9 +1318,12 @@ FDR_TEST_CASE(adversarial, a_cycle_is_rejected_and_a_chain_past_the_walk_bound_i
   Registry& registry = *deep.registry;
   const DomainClassRef rack(DomainClass::Rack);
   const Provenance provenance = authoritative("inv");
-  const std::size_t walk_bound = RegistryLimits::defaults().max_ancestor_walk;
-  FDR_CHECK_EQ(walk_bound, std::size_t{1024});
-  const std::size_t deepest = walk_bound + 1;
+  // The depth ceiling is what bounds a containment chain, and it is enforced
+  // when an edge is added, so a walk bounded by max_ancestor_walk can never
+  // truncate: validate() refuses a configuration whose walk bound is below it.
+  const std::size_t depth_ceiling = RegistryLimits::defaults().max_hierarchy_depth;
+  FDR_CHECK_EQ(depth_ceiling, std::size_t{64});
+  const std::size_t deepest = depth_ceiling + 1;
   std::vector<FailureDomainId> chain;
   chain.reserve(deepest);
   for (std::size_t index = 0; index < deepest; ++index) {
@@ -1337,12 +1340,20 @@ FDR_TEST_CASE(adversarial, a_cycle_is_rejected_and_a_chain_past_the_walk_bound_i
     FDR_CHECK_MSG(linked.committed(), "a chain edge was refused: " + describe(linked));
   }
   FDR_CHECK_EQ(registry.domain_count(), deepest);
+  // The chain is exactly as deep as the ceiling admits: every domain is
+  // reachable, and no walk truncates.
+  FDR_CHECK_EQ(registry.ancestors(chain[0]).size(), deepest - 1);
+  FDR_CHECK_EQ(registry.descendants(chain[deepest - 1]).size(), deepest - 1);
   {
     const Fingerprint before = Fingerprint::capture(registry);
     const Outcome refused = add_relation(registry, deep.session.authority(), chain[deepest - 1],
                                          chain[0], DomainRelationType::ContainedBy, "deep-close",
                                          provenance);
-    FDR_CHECK_EQ(refused.code, OutcomeCode::CycleRejected);
+    // The chain already sits at the depth ceiling, so closing it is refused by
+    // the depth rule before the cycle rule is consulted. Both are correct
+    // refusals of an illegal edge; neither is accepted.
+    FDR_CHECK(refused.code == OutcomeCode::CycleRejected ||
+              refused.code == OutcomeCode::InvalidHierarchy);
     const std::string drift = before.drift(registry);
     FDR_CHECK_MSG(drift.empty(), "closing the permitted-depth chain changed state: " + drift);
   }
@@ -1366,14 +1377,14 @@ FDR_TEST_CASE(adversarial, a_cycle_is_rejected_and_a_chain_past_the_walk_bound_i
                  "a bounded hierarchy walk was not reported as bounded: " + describe(refused));
     const std::string drift = before.drift(registry);
     FDR_CHECK_MSG(drift.empty(), "a bounded hierarchy walk changed state: " + drift);
-    // The read-only walks are breadth first and bounded by the same value, so a
-    // chain deeper than the bound yields the bound and never a stack overflow.
-    // The bound is applied silently here: ancestors() and descendants() have no
-    // truncation flag, unlike BlastRadius.
+    // The depth ceiling is enforced when an edge is added, so a chain can never
+    // be deeper than max_hierarchy_depth, and the read-only walks are therefore
+    // always complete: they cannot truncate, and they cannot recurse without
+    // bound.
     // Containment points from the contained domain to its container, so the
     // outermost domain is the one with a full descendant set.
-    FDR_CHECK_EQ(registry.descendants(last).size(), walk_bound);
-    FDR_CHECK_EQ(registry.ancestors(chain[0]).size(), walk_bound);
+    FDR_CHECK_EQ(registry.descendants(last).size(), deepest - 1);
+    FDR_CHECK_EQ(registry.ancestors(chain[0]).size(), deepest - 1);
   }
   std::string why;
   FDR_CHECK_MSG(registry.validate_state(&why), "the deep chain broke the state: " + why);
@@ -1439,11 +1450,18 @@ FDR_TEST_CASE(adversarial, duplicate_memberships_are_malformed_idempotent_or_sha
     FDR_CHECK_MSG(second.problem().empty(), "the second publisher did not attach: " + second.problem());
     const Fingerprint before = Fingerprint::capture(registry);
     const Outcome shared = attach_member(registry, second.authority(), domain.id, member, "a3", provenance);
-    FDR_CHECK_EQ(shared.code, OutcomeCode::Idempotent);
+    // Corroboration is recorded, not discarded: the second publisher's
+    // attestation is added to the same record rather than being mistaken for an
+    // exact replay.
+    FDR_CHECK_EQ(shared.code, OutcomeCode::Committed);
     FDR_CHECK(shared.membership.has_value());
     FDR_CHECK_MSG(*shared.membership == membership_id,
                  "two publishers produced two membership ids for the same fact");
     FDR_CHECK_EQ(registry.membership_count(), std::size_t{1});
+    // Corroboration is a committed change that adds an evidence entry, so the
+    // registry generation is expected to move; what must not move is the number
+    // of membership records.
+    FDR_CHECK_EQ(registry.membership(*shared.membership)->live_evidence_count(), std::size_t{2});
     const std::string drift = before.drift(registry);
     FDR_CHECK_MSG(drift.empty(), "a shared membership changed the counts: " + drift);
 
@@ -1482,10 +1500,16 @@ FDR_TEST_CASE(adversarial, equal_rank_disagreement_conflicts_and_a_weaker_class_
   FDR_CHECK_EQ(original.outcome.code, OutcomeCode::Committed);
   const FailureDomainGeneration first_generation = registry.domain(original.id)->generation;
   {
+    // A tie is between two authorities: the rival statement comes from a
+    // different publisher, not from the publisher that made the first one.
+    Session rival = add_session(registry, fixture.session.authority(), fixture.session.epoch,
+                                "rival", AuthorityScope::unrestricted(),
+                                EvidenceClass::DirectAuthoritativeInfrastructure);
+    FDR_CHECK_MSG(rival.problem().empty(), "the rival publisher did not attach: " + rival.problem());
     const Provenance other_source = provenance_of(
         ProvenanceSource::Cmdb, EvidenceClass::DirectAuthoritativeInfrastructure, "cmdb-1");
     const Outcome conflict =
-        declare_domain(registry, fixture.session.authority(), klass, "dc1", "pdu-1", "pdu-1",
+        declare_domain(registry, rival.authority(), klass, "dc1", "pdu-1", "pdu-1",
                        "d2", other_source);
     FDR_CHECK_EQ(conflict.code, OutcomeCode::DomainConflict);
     FDR_CHECK_EQ(registry.domain(original.id)->lifecycle, DomainLifecycle::Conflicted);
@@ -1689,16 +1713,18 @@ FDR_TEST_CASE(adversarial, forged_extension_namespaces_are_refused_and_never_exc
   FDR_CHECK(!DomainClassRef::parse("vendor:acme/" + control_name).has_value());
   FDR_CHECK(!DomainClassRef::parse("rack/1").has_value());
 
-  // A dot-only segment is accepted, because '.' is one of the five characters
-  // the grammar allows and there is no separate rule about path traversal. The
-  // value is not exclusive and classifies as Custom, so it cannot be used to
-  // claim a canonical class - but it is accepted text, and this case says so.
-  const std::optional<DomainClassRef> dots = DomainClassRef::parse("vendor:../..");
-  FDR_CHECK_MSG(dots.has_value(),
-               "a dot-only extension did not parse; the grammar changed and this case needs rereading");
-  FDR_CHECK_EQ(dots->to_string(), std::string("vendor:../.."));
-  FDR_CHECK_EQ(dots->classification(), DomainClass::Custom);
-  FDR_CHECK(!dots->is_exclusive());
+  // A segment made only of dots is a path component, not a namespace or name
+  // component, so it is refused rather than accepted as opaque text.
+  FDR_CHECK(!DomainClassRef::parse("vendor:../..").has_value());
+  FDR_CHECK(!DomainClassRef::parse("vendor:./x").has_value());
+  FDR_CHECK(!DomainClassRef::parse("admin:x/..").has_value());
+  FDR_CHECK(!DomainClassRef::parse("vendor:.../x").has_value());
+  // A dot inside a segment is still ordinary, as long as the segment carries at
+  // least one other character.
+  const std::optional<DomainClassRef> dotted = DomainClassRef::parse("vendor:acme.inc/x-1");
+  FDR_CHECK(dotted.has_value());
+  FDR_CHECK_EQ(dotted->classification(), DomainClass::Custom);
+  FDR_CHECK(!dotted->is_exclusive());
 
   // Through the public API a vendor class is usable, is not exclusive, and two
   // domains of it may hold the same member at once.
@@ -1798,7 +1824,10 @@ FDR_TEST_CASE(adversarial, exhausting_every_bound_leaves_a_consistent_registry) 
   {
     MembershipBatchRequest request =
         publication(fixture.session.authority(), first.id, {member_c}, "p1");
-    FDR_CHECK_EQ(registry.publish_memberships(request).code, OutcomeCode::Committed);
+    // max_memberships is enforced on the publication path too, and the whole
+    // publication is refused rather than partially applied.
+    FDR_CHECK_EQ(registry.publish_memberships(request).code, OutcomeCode::ResourceLimit);
+    FDR_CHECK_EQ(registry.membership_count(), std::size_t{2});
     MembershipBatchRequest oversized =
         publication(fixture.session.authority(), first.id, {member_c}, "p2");
     MembershipBatchEntry extra;

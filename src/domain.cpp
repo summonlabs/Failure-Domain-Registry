@@ -103,8 +103,9 @@ std::string DomainRelation::canonical_form() const {
   append_bytes(out, target.to_string());
   append_u8(out, static_cast<std::uint8_t>(type));
   append_bytes(out, provenance.canonical_form());
-  append_u64(out, created_at.value());
-  append_u64(out, created_epoch.value());
+  // created_at and created_epoch are process-local creation bookkeeping, not
+  // semantic identity, so they are excluded exactly as they are for domains and
+  // memberships.
   return out;
 }
 

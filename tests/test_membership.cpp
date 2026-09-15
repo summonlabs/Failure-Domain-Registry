@@ -756,10 +756,10 @@ FDR_TEST_CASE(membership, two_publishers_publish_one_membership_record) {
     FDR_CHECK_EQ(record->evidence.size(), std::size_t{2});
     FDR_CHECK_EQ(record->live_evidence_count(), std::size_t{2});
 
-    // The publisher index follows the headline provenance, so the record leaves
-    // the first publisher's index even though that publisher's evidence entry is
-    // still there.
-    FDR_CHECK_EQ(fixture.registry.memberships_of_publisher(fixture.publisher).size(), std::size_t{0});
+    // The publisher index is an evidence-owner index, so the record is still
+    // reachable from the first publisher: that publisher's evidence entry is
+    // still on the record, and fencing it must be able to find it.
+    FDR_CHECK_EQ(fixture.registry.memberships_of_publisher(fixture.publisher).size(), std::size_t{1});
     FDR_CHECK_EQ(fixture.registry.memberships_of_publisher(fixture.second_authority.publisher).size(),
                  std::size_t{1});
     check_state(fixture.registry);
@@ -842,9 +842,12 @@ FDR_TEST_CASE(membership, evidence_corroboration_follows_the_implemented_precede
     // An equally strong statement from a different source is not a tie to be
     // broken: the membership becomes indeterminate, and neither assertion is
     // stored as the record's headline.
-    const Outcome conflicted = attach_now(fixture, 5u, rack, member,
-                                          EvidenceClass::DirectHardwareController,
-                                          ProvenanceSource::OperatorInventory, "inventory-1");
+    // A tie is between two authorities, so the rival statement has to come from
+    // a publisher other than the one that made the first statement.
+    const AttachSpec rival_spec = direct_spec(ProvenanceSource::OperatorInventory,
+                                             EvidenceClass::DirectHardwareController, "inventory-1");
+    const Outcome conflicted =
+        attach_as(fixture, fixture.second_authority, 5u, rack, member, rival_spec);
     FDR_CHECK_EQ(conflicted.code, OutcomeCode::MembershipConflict);
     FDR_CHECK_MSG(conflicted.message.find("CONFLICTED") != std::string::npos, conflicted.message);
     FDR_CHECK(conflicted.membership.has_value());

@@ -60,6 +60,8 @@ struct RegistryState {
   // Incrementally maintained indexes. No mutation rebuilds an index.
   std::unordered_map<EntityId, std::vector<MembershipId>> by_entity;
   std::unordered_map<FailureDomainId, std::vector<MembershipId>> by_domain;
+  /// Memberships this publisher owns evidence on, not only those whose
+  /// headline provenance is this publisher.
   std::unordered_map<PublisherId, std::vector<MembershipId>> by_publisher;
   std::unordered_map<std::string, std::vector<FailureDomainId>> by_class;
   std::unordered_map<std::string, std::vector<FailureDomainId>> by_scope;
@@ -113,8 +115,11 @@ struct Registry::Impl {
   void store_relation(DomainRelation record);
 
   // --- rules ---------------------------------------------------------------
-  static void push_domain_history(FailureDomain& record, std::string cause, std::size_t max_entries);
-  static void push_membership_history(Membership& record, std::string cause, std::size_t max_entries);
+  /// Appends a lineage entry. It records the generation the record is at when
+  /// the change is recorded; store_domain/store_membership finalise the entry
+  /// with the post-change generation and lifecycle before it is committed.
+  void push_domain_history(FailureDomain& record, std::string cause, std::size_t max_entries);
+  void push_membership_history(Membership& record, std::string cause, std::size_t max_entries);
 
   bool has_relation(const FailureDomainId& source, const FailureDomainId& target,
                     DomainRelationType type) const;
@@ -140,9 +145,15 @@ struct Registry::Impl {
                                                EntityGeneration superseded_generation,
                                                MembershipLifecycle target,
                                                const std::string& cause);
+  /// Demotes every process-bound domain that this incarnation established.
+  /// Shared by reincarnation, explicit fencing and an epoch advance, so the
+  /// three paths cannot diverge.
+  void demote_process_bound_domains(const PublisherId& publisher, const WorkerBootId& worker_boot,
+                                    const std::string& cause);
   void withdraw_publisher_evidence(const PublisherId& publisher, const WorkerBootId& worker_boot,
                                    bool match_boot, EvidenceClass evidence,
-                                   MembershipLifecycle target, const std::string& cause);
+                                   bool only_process_bound, MembershipLifecycle target,
+                                   const std::string& cause);
   void invalidate_derived_memberships(const std::vector<EntityId>& affected);
 
   // --- coverage ------------------------------------------------------------
@@ -173,11 +184,30 @@ struct Registry::Impl {
                         const AuthorityContext& authority) const;
   Outcome check_domain_limits() const;
   Outcome check_membership_limits() const;
+  /// Rejects a record whose persisted encoding would exceed max_record_bytes.
+  Outcome check_record_size(const FailureDomain& record) const;
+  Outcome check_record_size(const Membership& record) const;
+  Outcome check_record_size(const DomainRelation& record) const;
+  /// Longest containment chain above (respectively below) a domain.
+  std::size_t hierarchy_depth_above(const FailureDomainId& id) const;
+  std::size_t hierarchy_depth_below(const FailureDomainId& id) const;
 
   void bump_generation();
   StateDigest compute_state_digest() const;
   void gc_idempotency(const PublisherId& publisher);
 };
+
+/// Semantic digest of a registry state: the same classification digests the
+/// same regardless of the order it arrived in.
+StateDigest compute_state_digest_of(const RegistryState& state);
+
+/// Byte width of a record in the persisted encoding.
+std::size_t encoded_domain_bytes(const FailureDomain& record);
+std::size_t encoded_membership_bytes(const Membership& record);
+std::size_t encoded_relation_bytes(const DomainRelation& record);
+
+/// Every publisher that owns evidence on a membership, headline included.
+std::vector<PublisherId> membership_evidence_publishers(const Membership& record);
 
 /// Canonical ordering helpers used by digests, snapshot diffs and the CLI.
 bool membership_id_less(const MembershipId& left, const MembershipId& right);

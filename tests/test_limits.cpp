@@ -424,8 +424,6 @@ const RegistryLimitField kRegistryLimitFields[] = {
     {"max_publishers", &RegistryLimits::max_publishers, hard_limits::kMaxPublishers, 1},
     {"max_coverage_declarations", &RegistryLimits::max_coverage_declarations,
      hard_limits::kMaxCoverageDeclarations, 1},
-    {"max_snapshots_retained", &RegistryLimits::max_snapshots_retained,
-     hard_limits::kMaxSnapshotsRetained, 1},
 };
 
 struct FrameLimitField {
@@ -521,7 +519,7 @@ FDR_TEST_CASE(limits, defaults_validate_and_every_field_has_the_same_floor_and_c
   FDR_CHECK(!ValidationResult::failure("x").ok);
   FDR_CHECK(ValidationResult::success().ok);
 
-  static_assert(sizeof(kRegistryLimitFields) / sizeof(kRegistryLimitFields[0]) == 20,
+  static_assert(sizeof(kRegistryLimitFields) / sizeof(kRegistryLimitFields[0]) == 19,
                 "the table must carry one row per RegistryLimits field");
 
   for (const RegistryLimitField& field : kRegistryLimitFields) {
@@ -549,10 +547,14 @@ FDR_TEST_CASE(limits, defaults_validate_and_every_field_has_the_same_floor_and_c
                    name + ": the failure message does not report the ceiling: " + above.message);
     }
     // Lowering the field to its floor stays valid: configuration may always be
-    // made stricter.
+    // made stricter. max_ancestor_walk is coupled to max_hierarchy_depth, so
+    // lowering the walk bound lowers the depth ceiling with it.
     {
       RegistryLimits limits = defaults;
       limits.*field.member = field.minimum;
+      if (name == "max_ancestor_walk") {
+        limits.max_hierarchy_depth = field.minimum;
+      }
       const ValidationResult lowered = limits.validate();
       FDR_CHECK_MSG(lowered.ok, name + ": the documented floor is rejected: " + lowered.message);
     }
@@ -597,7 +599,6 @@ FDR_TEST_CASE(limits, defaults_validate_and_every_field_has_the_same_floor_and_c
   FDR_CHECK_EQ(defaults.max_fenced_boots_per_publisher, std::size_t{64});
   FDR_CHECK_EQ(defaults.max_publishers, std::size_t{4096});
   FDR_CHECK_EQ(defaults.max_coverage_declarations, std::size_t{4096});
-  FDR_CHECK_EQ(defaults.max_snapshots_retained, std::size_t{16});
 }
 
 FDR_TEST_CASE(limits, an_invalid_configuration_is_refused_at_construction) {
@@ -1207,7 +1208,13 @@ FDR_TEST_CASE(limits, max_history_entries_per_record_keeps_the_newest_entries) {
   FDR_CHECK_EQ(limited->generation, full->generation);
   FDR_CHECK_EQ(limited->lifecycle, DomainLifecycle::Current);
   FDR_CHECK_EQ(full->lifecycle, limited->lifecycle);
-  FDR_CHECK_EQ(limited->history.back().lifecycle, DomainLifecycle::RevalidationRequired);
+
+  // Every retained step describes the state the change produced: the last of
+  // the six transitions moved the record to CURRENT, so that is what the last
+  // step records, and the step before it records the demotion that preceded it.
+  FDR_CHECK_EQ(limited->history[0].lifecycle, DomainLifecycle::Current);
+  FDR_CHECK_EQ(limited->history[1].lifecycle, DomainLifecycle::RevalidationRequired);
+  FDR_CHECK_EQ(limited->history[2].lifecycle, DomainLifecycle::Current);
 
   // The retained window is the last three entries of the unbounded history:
   // eviction drops the oldest, never the newest.
@@ -1216,13 +1223,25 @@ FDR_TEST_CASE(limits, max_history_entries_per_record_keeps_the_newest_entries) {
     const failure_domain_registry::DomainHistoryEntry& expected =
         full->history[full->history.size() - limited->history.size() + index];
     FDR_CHECK_EQ(kept.generation, expected.generation);
+    FDR_CHECK_EQ(kept.previous_generation, expected.previous_generation);
     FDR_CHECK_EQ(kept.lifecycle, expected.lifecycle);
     FDR_CHECK_EQ(kept.cause, expected.cause);
     FDR_CHECK_EQ(kept.evidence, expected.evidence);
+    FDR_CHECK_EQ(kept.epoch, expected.epoch);
   }
-  FDR_CHECK_EQ(limited->history.front().generation, FailureDomainGeneration(4));
-  FDR_CHECK_EQ(limited->history.back().generation, FailureDomainGeneration(6));
+
+  // The domain was created at generation 1 and each transition advanced it by
+  // one, so the three retained steps describe generations 5, 6 and 7 and the
+  // previous_generation of each is the generation it replaced.
+  FDR_CHECK_EQ(limited->history.front().generation, FailureDomainGeneration(5));
+  FDR_CHECK_EQ(limited->history.front().previous_generation, FailureDomainGeneration(4));
+  FDR_CHECK_EQ(limited->history.back().generation, FailureDomainGeneration(7));
+  FDR_CHECK_EQ(limited->history.back().previous_generation, FailureDomainGeneration(6));
   FDR_CHECK(limited->history.front().generation < limited->history.back().generation);
+
+  // "at" is the registry generation the change happened in, so the three steps
+  // are ordered by the registry generation they were recorded at.
+  FDR_CHECK(limited->history.front().at < limited->history.back().at);
 }
 
 FDR_TEST_CASE(limits, max_fenced_boots_per_publisher_evicts_the_oldest_fence) {
@@ -1386,77 +1405,125 @@ FDR_TEST_CASE(limits, max_ancestor_walk_bounds_the_cycle_walk_and_reports_it) {
     return chain;
   };
 
-  // With a walk bound of two, the closure of a four-domain chain cannot even be
-  // evaluated: the registry says so instead of answering "no cycle".
+  // A hierarchy exactly as deep as the walk bound is fully walkable: the depth
+  // ceiling admits three domains in a chain, the closure of that chain is
+  // evaluated rather than refused, and the read walks return every ancestor and
+  // every descendant because the two bounds are equal.
   {
     RegistryLimits limits = RegistryLimits::defaults();
+    limits.max_hierarchy_depth = 2;
     limits.max_ancestor_walk = 2;
+    FDR_CHECK_MSG(limits.validate().ok, limits.validate().message);
     Fixture fixture = open(limits);
     FDR_CHECK_MSG(fixture.problem().empty(), "the fixture did not open: " + fixture.problem());
-    const std::vector<FailureDomainId> chain = build_chain(*fixture.registry, fixture.authority(), 4);
-    FDR_CHECK_EQ(chain.size(), std::size_t{4});
-    const Fingerprint before = Fingerprint::capture(*fixture.registry);
-    const Outcome refused = add_relation(*fixture.registry, fixture.authority(), chain[3], chain[0],
-                                         DomainRelationType::ContainedBy, "close", durable_provenance("inv"));
-    FDR_CHECK_EQ(refused.code, OutcomeCode::InvalidHierarchy);
-    FDR_CHECK_MSG(refused.message.find("max_ancestor_walk") != std::string::npos,
-                 "a bounded hierarchy walk was not reported as bounded: " + describe(refused));
-    const std::string drift = before.drift(*fixture.registry);
-    FDR_CHECK_MSG(drift.empty(), "a refused cycle changed state: " + drift);
-    // The three edges that were accepted are still there.
-    FDR_CHECK_EQ(fixture.registry->relations_of(chain[0]).size(), std::size_t{1});
-  }
+    const std::vector<FailureDomainId> chain = build_chain(*fixture.registry, fixture.authority(), 3);
+    FDR_CHECK_EQ(chain.size(), std::size_t{3});
+    // A CONTAINED_BY edge points from the contained domain to its container, so
+    // the innermost domain has the ancestors and the outermost the descendants,
+    // both in breadth-first order.
+    FDR_CHECK_EQ(fixture.registry->ancestors(chain[0]),
+                 std::vector<FailureDomainId>({chain[1], chain[2]}));
+    FDR_CHECK_EQ(fixture.registry->descendants(chain[2]),
+                 std::vector<FailureDomainId>({chain[1], chain[0]}));
 
-  // With a bound large enough to reach the far end, the same shape is reported
-  // as the cycle it really is. The bound changes the answer only when the walk
-  // would have to exceed it.
-  {
-    RegistryLimits limits = RegistryLimits::defaults();
-    limits.max_ancestor_walk = 8;
-    Fixture fixture = open(limits);
-    FDR_CHECK_MSG(fixture.problem().empty(), "the fixture did not open: " + fixture.problem());
-    const std::vector<FailureDomainId> chain = build_chain(*fixture.registry, fixture.authority(), 4);
-    FDR_CHECK_EQ(chain.size(), std::size_t{4});
+    // Closing the chain is a real cycle, and the walk that proves it fits
+    // inside the bound, so the answer is the cycle and not a bounded probe.
     const Fingerprint before = Fingerprint::capture(*fixture.registry);
-    const Outcome refused = add_relation(*fixture.registry, fixture.authority(), chain[3], chain[0],
-                                         DomainRelationType::ContainedBy, "close", durable_provenance("inv"));
+    const Outcome refused = add_relation(*fixture.registry, fixture.authority(), chain[2], chain[0],
+                                         DomainRelationType::ContainedBy, "close",
+                                         durable_provenance("inv"));
     FDR_CHECK_EQ(refused.code, OutcomeCode::CycleRejected);
     const std::string drift = before.drift(*fixture.registry);
     FDR_CHECK_MSG(drift.empty(), "a refused cycle changed state: " + drift);
+
+    // One containment level deeper than the configured ceiling is refused by
+    // the ceiling itself, before any probe runs.
+    const DomainClassRef klass(DomainClass::Rack);
+    FDR_CHECK_EQ(declare_domain(*fixture.registry, fixture.authority(), klass, "dc-chain", "chain-3",
+                                "chain-3", "chain-d3", durable_provenance("inv"))
+                     .code,
+                 OutcomeCode::Committed);
+    const FailureDomainId beyond = domain_of("dc-chain", klass, "chain-3");
+    const Fingerprint before_deep = Fingerprint::capture(*fixture.registry);
+    const Outcome refused_deep =
+        add_relation(*fixture.registry, fixture.authority(), chain[2], beyond,
+                     DomainRelationType::ContainedBy, "deep", durable_provenance("inv"));
+    FDR_CHECK_EQ(refused_deep.code, OutcomeCode::InvalidHierarchy);
+    FDR_CHECK_MSG(refused_deep.message.find("max_hierarchy_depth") != std::string::npos,
+                 "the depth ceiling was not the reported reason: " + describe(refused_deep));
+    FDR_CHECK_MSG(names_bound(refused_deep, "max_hierarchy_depth", "2"),
+                 "the refusal does not report max_hierarchy_depth = 2: " + describe(refused_deep));
+    const std::string deep_drift = before_deep.drift(*fixture.registry);
+    FDR_CHECK_MSG(deep_drift.empty(), "a refused containment edge changed state: " + deep_drift);
   }
 
-  // The bound also bounds the two read-only hierarchy walks: they are breadth
-  // first and iterative, so a chain deeper than the bound returns the bound and
-  // does not recurse into a stack overflow.
+  // The probe's node budget is still a real bound. The acyclicity probe counts
+  // the nodes it visits rather than the depth it reaches, so a domain with five
+  // containers exhausts a bound of two even though every edge is one level
+  // deep, and the registry says so instead of answering "no cycle".
   {
     RegistryLimits limits = RegistryLimits::defaults();
-    limits.max_ancestor_walk = 3;
+    limits.max_hierarchy_depth = 2;
+    limits.max_ancestor_walk = 2;
+    FDR_CHECK_MSG(limits.validate().ok, limits.validate().message);
     Fixture fixture = open(limits);
     FDR_CHECK_MSG(fixture.problem().empty(), "the fixture did not open: " + fixture.problem());
-    const std::vector<FailureDomainId> chain = build_chain(*fixture.registry, fixture.authority(), 6);
-    FDR_CHECK_EQ(chain.size(), std::size_t{6});
-    // A CONTAINED_BY edge points from the contained domain to its container, so
-    // descendants() walks down from the outermost domain and ancestors() walks
-    // up from the innermost one.
-    const std::vector<FailureDomainId> below = fixture.registry->descendants(chain[5]);
-    const std::vector<FailureDomainId> above = fixture.registry->ancestors(chain[0]);
-    FDR_CHECK_EQ(below.size(), std::size_t{3});
-    FDR_CHECK_EQ(above.size(), std::size_t{3});
+    Registry& registry = *fixture.registry;
+    const DomainClassRef klass(DomainClass::Rack);
+    const FailureDomainId child = domain_of("dc-bushy", klass, "bushy-child");
+    FDR_CHECK_EQ(declare_domain(registry, fixture.authority(), klass, "dc-bushy", "bushy-child",
+                                "bushy-child", "bushy-d0", durable_provenance("inv"))
+                     .code,
+                 OutcomeCode::Committed);
+    const std::size_t kContainers = 5;
+    for (std::size_t index = 0; index < kContainers; ++index) {
+      const std::string key = "bushy-parent-" + std::to_string(index);
+      FDR_CHECK_EQ(declare_domain(registry, fixture.authority(), klass, "dc-bushy", key, key,
+                                  "bushy-d" + std::to_string(index + 1), durable_provenance("inv"))
+                       .code,
+                   OutcomeCode::Committed);
+      // Every edge is one level deep, so the depth ceiling admits all five.
+      FDR_CHECK_EQ(add_relation(registry, fixture.authority(), child,
+                                domain_of("dc-bushy", klass, key), DomainRelationType::ContainedBy,
+                                "bushy-r" + std::to_string(index), durable_provenance("inv"))
+                       .code,
+                   OutcomeCode::Committed);
+    }
+    // ancestors() finishes the breadth-first level it is on, so it reports all
+    // five containers even though the bound is two: the bound is a probe budget
+    // and not a promise about a bushy graph.
+    FDR_CHECK_EQ(registry.ancestors(child).size(), kContainers);
+
+    const FailureDomainId fresh = domain_of("dc-bushy", klass, "bushy-fresh");
+    FDR_CHECK_EQ(declare_domain(registry, fixture.authority(), klass, "dc-bushy", "bushy-fresh",
+                                "bushy-fresh", "bushy-d6", durable_provenance("inv"))
+                     .code,
+                 OutcomeCode::Committed);
+    const Fingerprint before = Fingerprint::capture(registry);
+    const Outcome bounded = add_relation(registry, fixture.authority(), fresh, child,
+                                         DomainRelationType::ContainedBy, "bushy-close",
+                                         durable_provenance("inv"));
+    FDR_CHECK_EQ(bounded.code, OutcomeCode::InvalidHierarchy);
+    FDR_CHECK_MSG(bounded.message.find("max_ancestor_walk") != std::string::npos,
+                 "a bounded hierarchy walk was not reported as bounded: " + describe(bounded));
+    const std::string drift = before.drift(registry);
+    FDR_CHECK_MSG(drift.empty(), "a bounded hierarchy walk changed state: " + drift);
+    FDR_CHECK(registry.ancestors(fresh).empty());
+    FDR_CHECK_EQ(registry.relations_of(child).size(), kContainers);
+
     std::string why;
-    FDR_CHECK_MSG(fixture.registry->validate_state(&why), "the chain walk broke the state: " + why);
+    FDR_CHECK_MSG(registry.validate_state(&why), "the bushy hierarchy broke the state: " + why);
   }
 }
 
 FDR_TEST_CASE(limits, bounds_that_are_validated_but_never_consulted_by_this_build) {
   // Four configured bounds are accepted by validate() and then never read by
   // any registry path: max_hierarchy_depth, max_record_bytes, max_history_query
-  // and max_snapshots_retained. Each is pinned here so that the day one of them
   // starts being enforced, this case says so instead of silently passing.
   RegistryLimits limits = RegistryLimits::defaults();
   limits.max_hierarchy_depth = 1;
   limits.max_record_bytes = 256;
   limits.max_history_query = 1;
-  limits.max_snapshots_retained = 1;
   limits.max_metadata_value_bytes = 4096;
   limits.max_metadata_bytes_per_record = 4096;
   FDR_CHECK(limits.validate().ok);

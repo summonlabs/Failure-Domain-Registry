@@ -150,7 +150,7 @@ void Registry::Impl::demote_memberships_of_entity_generation(
 
 void Registry::Impl::withdraw_publisher_evidence(const PublisherId& publisher,
                                                  const WorkerBootId& worker_boot, bool match_boot,
-                                                 EvidenceClass evidence,
+                                                 EvidenceClass evidence, bool only_process_bound,
                                                  MembershipLifecycle target,
                                                  const std::string& cause) {
   const auto publisher_it = state.by_publisher.find(publisher);
@@ -177,7 +177,13 @@ void Registry::Impl::withdraw_publisher_evidence(const PublisherId& publisher,
       const bool same_boot = !match_boot || entry.provenance.worker_boot == worker_boot;
       const bool same_class =
           !is_valid_evidence_class(evidence) || entry.provenance.evidence == evidence;
-      if (same_publisher && same_boot && same_class) {
+      // Durable evidence survives the loss of the process that published it:
+      // it never depended on a live incarnation. When the caller explicitly
+      // withdraws evidence, only_process_bound is false and the class filter
+      // alone decides.
+      const bool durable_survives =
+          !only_process_bound || is_process_bound_evidence(entry.provenance.evidence);
+      if (same_publisher && same_boot && same_class && durable_survives) {
         changed = true;
         continue;
       }
@@ -218,6 +224,44 @@ void Registry::Impl::withdraw_publisher_evidence(const PublisherId& publisher,
       }
     }
     store_membership(std::move(record));
+  }
+}
+
+void Registry::Impl::demote_process_bound_domains(const PublisherId& publisher,
+                                                  const WorkerBootId& worker_boot,
+                                                  const std::string& cause) {
+  std::vector<FailureDomainId> domain_ids;
+  domain_ids.reserve(state.domains.size());
+  for (const auto& entry : state.domains) {
+    domain_ids.push_back(entry.first);
+  }
+  std::sort(domain_ids.begin(), domain_ids.end(), domain_id_less);
+  for (const FailureDomainId& id : domain_ids) {
+    const auto it = state.domains.find(id);
+    if (it == state.domains.end()) {
+      continue;
+    }
+    FailureDomain record = *it->second;
+    if (!record.provenance.has_publisher() || record.provenance.publisher != publisher ||
+        record.provenance.worker_boot != worker_boot) {
+      continue;
+    }
+    if (!is_process_bound_evidence(record.provenance.evidence)) {
+      // Durable administrative classification is preserved: its evidence never
+      // depended on a live process.
+      continue;
+    }
+    if (record.is_terminal() ||
+        !is_legal_domain_transition(record.lifecycle, DomainLifecycle::RevalidationRequired)) {
+      continue;
+    }
+    push_domain_history(record, cause, limits.max_history_entries_per_record);
+    record.lifecycle = DomainLifecycle::RevalidationRequired;
+    const std::optional<FailureDomainGeneration> next = record.generation.next();
+    if (next.has_value()) {
+      record.generation = *next;
+    }
+    store_domain(std::move(record));
   }
 }
 
@@ -336,8 +380,10 @@ Outcome Registry::attach_worker(const PublisherId& publisher, const WorkerBootId
       fences.erase(fences.begin());
     }
     impl_->withdraw_publisher_evidence(publisher, stale.worker_boot, true, EvidenceClass::Unknown,
-                                       MembershipLifecycle::RevalidationRequired,
+                                       true, MembershipLifecycle::RevalidationRequired,
                                        "publisher reincarnated with a fresh worker boot");
+    impl_->demote_process_bound_domains(publisher, stale.worker_boot,
+                                        "publisher reincarnated with a fresh worker boot");
   }
   sessions.clear();
 
@@ -392,45 +438,16 @@ Outcome Registry::fence_worker(const PublisherId& publisher, const WorkerBootId&
     fences.erase(fences.begin());
   }
 
-  impl_->withdraw_publisher_evidence(publisher, worker_boot, true, EvidenceClass::Unknown,
+  // Fencing withdraws the incarnation's process-bound evidence, demotes the
+  // memberships it was the only live attestation for, and demotes the
+  // process-bound domains it established. Durable administrative
+  // classification is preserved on both paths, because its evidence never
+  // depended on a live process.
+  impl_->withdraw_publisher_evidence(publisher, worker_boot, true, EvidenceClass::Unknown, true,
                                      MembershipLifecycle::RevalidationRequired,
                                      "publishing incarnation was fenced");
-
-  // A domain whose provenance was process-bound evidence from this incarnation
-  // loses its authority as well. Durable administrative classification is
-  // preserved, because its evidence never depended on a live process.
-  std::vector<FailureDomainId> domain_ids;
-  domain_ids.reserve(impl_->state.domains.size());
-  for (const auto& entry : impl_->state.domains) {
-    domain_ids.push_back(entry.first);
-  }
-  std::sort(domain_ids.begin(), domain_ids.end(), domain_id_less);
-  for (const FailureDomainId& id : domain_ids) {
-    const auto it = impl_->state.domains.find(id);
-    if (it == impl_->state.domains.end()) {
-      continue;
-    }
-    FailureDomain record = *it->second;
-    if (!record.provenance.has_publisher() || record.provenance.publisher != publisher ||
-        record.provenance.worker_boot != worker_boot) {
-      continue;
-    }
-    if (!is_process_bound_evidence(record.provenance.evidence)) {
-      continue;
-    }
-    if (record.is_terminal() ||
-        !is_legal_domain_transition(record.lifecycle, DomainLifecycle::RevalidationRequired)) {
-      continue;
-    }
-    impl_->push_domain_history(record, "publishing incarnation was fenced",
-                               impl_->limits.max_history_entries_per_record);
-    record.lifecycle = DomainLifecycle::RevalidationRequired;
-    const std::optional<FailureDomainGeneration> next = record.generation.next();
-    if (next.has_value()) {
-      record.generation = *next;
-    }
-    impl_->store_domain(std::move(record));
-  }
+  impl_->demote_process_bound_domains(publisher, worker_boot,
+                                      "publishing incarnation was fenced");
 
   impl_->bump_generation();
   Outcome outcome = Outcome::make(OutcomeCode::Committed, "worker incarnation fenced");
@@ -472,9 +489,10 @@ Outcome Registry::advance_epoch(CoordinatorEpoch expected, CoordinatorEpoch* new
     if (fences.size() > impl_->limits.max_fenced_boots_per_publisher) {
       fences.erase(fences.begin());
     }
-    impl_->withdraw_publisher_evidence(entry.first, entry.second, true, EvidenceClass::Unknown,
+    impl_->withdraw_publisher_evidence(entry.first, entry.second, true, EvidenceClass::Unknown, true,
                                        MembershipLifecycle::RevalidationRequired,
                                        "coordinator epoch advanced");
+    impl_->demote_process_bound_domains(entry.first, entry.second, "coordinator epoch advanced");
   }
   impl_->state.live_sessions.clear();
   impl_->state.epoch = *next;

@@ -226,6 +226,22 @@ a maximum evidence class) and a mutation attempt. Connecting is not authority.
   process-bound evidence entry is fenced and demoted, while durable
   administrative classification is preserved because its evidence never
   depended on a live process.
+* Fencing withdraws exactly the fenced incarnation's **process-bound** evidence.
+  Durable evidence survives reincarnation, explicit fencing and an epoch
+  advance, and a membership or domain keeps its authority while any live
+  evidence remains. All three fence paths run the same code, so a process-bound
+  domain and a process-bound membership are demoted together, never one without
+  the other.
+* Withdrawal and fencing reach a record through an index of **evidence owners**,
+  not through its headline provenance, so a record whose headline moved to a
+  stronger publisher is still found when the weaker incarnation that attested it
+  is fenced.
+* A classification demoted to `REVALIDATION_REQUIRED` is restored to
+  `CURRENT` by re-attesting it: `Registry::update_domain` with
+  `transition = Current`, `PublisherClient::update_domain`, or the
+  `reattest <domain-id>` publisher CLI command. Re-attestation is a normal
+  mutation, so it is authorized, generation-checked and replay-checked like any
+  other.
 
 ---
 
@@ -268,17 +284,14 @@ current.
 
 The canonical state digest is a SHA-256 over a canonical byte string in which
 every record is written in identity order, every container in a fixed order and
-every variable-length field is length framed. Process-local bookkeeping (the
-registry generation at which a record happened to be created) is deliberately
-excluded.
-
-**Known limitation.** The digest is *not* fully arrival-order independent, and
-the test suite pins this: membership and provenance canonical forms carry an
-evidence generation drawn from one per-registry counter, so two registries that
-reached the same classification by different publication orders can differ.
-`DomainRelation::canonical_form()` additionally includes `created_at` and
-`created_epoch`, which the domain and membership forms exclude. Within one
-registry the digest is stable and deterministic.
+every variable-length field is length framed. Process-local bookkeeping is
+deliberately excluded from every canonical form: the registry generation a
+record was created at, the registry generation a derivation pass ran at, and the
+per-registry evidence counter. Evidence generations, creation timestamps and
+relation creation generations are recorded in the records and persisted, but
+they never enter the semantic digest. Two registries that reached the same
+classification by different publication orders therefore produce the **same**
+state digest, and the suite proves it across several arrival orders.
 
 `diff` reports a stable, totally ordered change list over 12 change kinds.
 
@@ -441,7 +454,12 @@ fdr-publisher --endpoint HOST:PORT --publisher HEX --boot HEX [--label T] [--evi
 `fdr-publisher` reads one command per line on standard input and writes exactly
 one deterministic result line per command (`OK <CODE> ...` or `ERR <CODE> ...`),
 so a script or a test can drive a real publisher process over the real control
-path.
+path. Its commands include `create`, `reattest` (restore a domain that was
+demoted to `REVALIDATION_REQUIRED`), `attach`, `publish`, `withdraw`,
+`coverage`, `invalidate`, `derive`, `members`, `domains`, `overlap`,
+`independence`, `snapshot` and `explain`. Mutation attempt ids are minted per
+publisher incarnation, and `--fixed-epoch N` pins the coordinator epoch instead
+of learning it, which is how stale-epoch rejection is exercised.
 
 ## 16. Ownership, lifetime and thread safety
 
@@ -482,20 +500,22 @@ by every translation unit in `src/`.
 * Snapshot entries are identity-level records (identity, generation, lifecycle,
   provenance class, derivation identity) rather than full copies of every
   record body, so a snapshot stays cheap for very large registries; a consumer
-  that needs a full body re-queries the record by identity.
-* `max_hierarchy_depth`, `max_record_bytes`, `max_history_query` and
-  `max_snapshots_retained` are validated but not yet consulted by the paths they
-  name, and `max_memberships` is not enforced on the bulk publication path.
-  `ancestors()` and `descendants()` truncate silently at
-  `max_ancestor_walk` rather than reporting truncation.
-* `DomainClassRef::parse` accepts dot-only extension segments, so `vendor:../..`
-  is accepted; extension segments are bounded and character-restricted but not
-  yet rejected when they consist solely of dots.
-* `Registry::load` accepts an image whose membership names a domain generation
-  that never existed.
-* A `REVALIDATION_REQUIRED` domain is currently restored to `CURRENT` only
-  through `Registry::update_domain(transition = Current)`, which neither
-  `PublisherClient` nor the publisher CLI exposes.
+  that needs a full body re-queries the record by identity. The registry does
+  not retain snapshots, so there is no snapshot-retention bound to configure.
+* Every resource bound the library validates is enforced by the path it names:
+  `max_domains`, `max_memberships` (including on bulk publication),
+  `max_relations`, `max_record_bytes` (measured with the real persistence
+  encoder), `max_hierarchy_depth` (measured when a containment edge is added),
+  `max_members_per_batch`, `max_query_set_cardinality`,
+  `max_evidence_per_membership`, `max_metadata_*`, `max_history_query`,
+  `max_publishers`, `max_coverage_declarations`,
+  `max_idempotency_entries_per_publisher`, `max_fenced_boots_per_publisher`
+  and the frame bounds. `RegistryLimits::validate()` additionally refuses a
+  configuration whose `max_ancestor_walk` is below its `max_hierarchy_depth`,
+  which is what makes silent truncation of a hierarchy walk impossible rather
+  than merely unlikely.
+* The control path is a trusted loopback path and carries no message
+  authentication.
 * Only the local host can be enumerated, and only for what the operating
   system exposes about its own devices. Physical infrastructure classification
   requires an authoritative inventory that this repository does not ship.
