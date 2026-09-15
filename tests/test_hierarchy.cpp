@@ -11,9 +11,11 @@
 //
 // A rejected relation is checked twice: the OutcomeCode says why it was refused,
 // and the relation count, the state generation and validate_state together prove
-// that nothing was committed behind the refusal. The bounded walks are asserted
-// at the bound they actually stop at, which is max_ancestor_walk and not
-// max_hierarchy_depth: the latter is a configured ceiling that no walk consults.
+// that nothing was committed behind the refusal. Two bounds are asserted
+// separately: max_hierarchy_depth is the true longest containment chain a
+// CONTAINED_BY edge may create, measured when that edge is added, and
+// max_ancestor_walk is the separate budget of the acyclicity probe and of the
+// read walks.
 //
 // The last case pins the replay window every mutation shares: an attempt id that
 // fell out of the per-publisher idempotency table is re-evaluated and answered
@@ -42,6 +44,7 @@
 #include "failure_domain_registry/registry.hpp"
 #include "failure_domain_registry/relation.hpp"
 #include "failure_domain_registry/requests.hpp"
+#include "support/containment_probe.hpp"
 #include "support/test_harness.hpp"
 
 namespace {
@@ -237,6 +240,39 @@ bool has_edge(Registry& registry, const FailureDomainId& first, const FailureDom
   const DomainRelationId expected = relation_id_for(first, second, type);
   for (const DomainRelation& relation : registry.relations_of(first)) {
     if (relation.id == expected) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Creates `count` rack domains named "<prefix><index>" and returns their ids in
+/// creation order.
+std::vector<FailureDomainId> create_domains(Registry& registry, const Fixture& fixture,
+                                            const std::string& prefix, std::size_t count,
+                                            std::uint64_t first_attempt) {
+  std::vector<FailureDomainId> ids;
+  for (std::size_t index = 0; index < count; ++index) {
+    const std::string key = prefix + std::to_string(index);
+    const DomainHandle handle =
+        create_domain(registry, fixture, DomainClass::Rack, "dc1", key, first_attempt + index);
+    if (handle.outcome.code != OutcomeCode::Committed) {
+      ::fdrtest::fail(__FILE__, __LINE__,
+                      "creating " + key + " was refused: " + handle.outcome.message);
+    }
+    ids.push_back(handle.id);
+  }
+  return ids;
+}
+
+/// True when a refusal names the hierarchy ceiling and the depth it measured.
+bool reports_ceiling(const Outcome& outcome, std::size_t ceiling, std::size_t measured) {
+  for (const failure_domain_registry::ExplanationStep& step : outcome.steps) {
+    if (step.stage != "hierarchy" || step.field != "max_hierarchy_depth") {
+      continue;
+    }
+    if (step.value == std::to_string(ceiling) &&
+        step.detail.find("depth is " + std::to_string(measured)) != std::string::npos) {
       return true;
     }
   }
@@ -941,6 +977,309 @@ FDR_TEST_CASE(hierarchy, containment_stays_acyclic_beside_a_symmetric_cycle) {
 
   std::string why;
   FDR_CHECK_MSG(fixture.registry->validate_state(&why), "the registry did not validate: " + why);
+}
+
+// ---------------------------------------------------------------------------
+// Longest-path depth enforcement
+// ---------------------------------------------------------------------------
+//
+// max_hierarchy_depth is a ceiling on the true longest containment chain, and a
+// containment graph is a DAG rather than a tree: one domain may have several
+// containers reached by routes of different lengths. Counting the levels a
+// breadth-first walk reaches measures the shortest route to each container and
+// therefore undercounts the real chain, so every case below states the depth
+// twice: once through the registry and once through the independent topological
+// measurement in support/containment_probe.hpp, which reads the graph back from
+// the public relation query.
+
+FDR_TEST_CASE(hierarchy, multi_parent_paths_are_measured_by_the_longest_chain) {
+  RegistryLimits limits = RegistryLimits::defaults();
+  limits.max_hierarchy_depth = 3;
+  limits.max_ancestor_walk = 1024;
+  FDR_CHECK_MSG(limits.validate().ok, limits.validate().message);
+  Fixture fixture = make_fixture(limits);
+  require_fixture(*fixture.registry, fixture);
+  Registry& registry = *fixture.registry;
+
+  // A is contained by B and by C, and the two routes to Z differ in length:
+  // A<B<Z is two edges while A<C<D<Z is three, so the real longest chain above A
+  // is three - one short of the ceiling - and a hop count would say two.
+  const std::vector<FailureDomainId> chain = create_domains(registry, fixture, "up", 5, 100);
+  const FailureDomainId A = chain[0];
+  const FailureDomainId B = chain[1];
+  const FailureDomainId C = chain[2];
+  const FailureDomainId D = chain[3];
+  const FailureDomainId Z = chain[4];
+  FDR_CHECK_EQ(add_relation(registry, fixture, A, B, 200).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, A, C, 201).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, C, D, 202).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, D, Z, 203).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, B, Z, 204).code, OutcomeCode::Committed);
+  {
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(registry);
+    FDR_CHECK_EQ(edges.size(), std::size_t{5});
+    FDR_CHECK_EQ(fdrtest::longest_chain(edges, A, true), std::size_t{3});
+    FDR_CHECK_EQ(fdrtest::max_containment_depth(edges), limits.max_hierarchy_depth);
+    // Both routes are visible to the read walk, and the walk is complete
+    // because the ceiling is not above the walk bound.
+    FDR_CHECK_EQ(registry.ancestors(A), sorted_ids({B, C, D, Z}));
+    FDR_CHECK_EQ(registry.ancestors(A).size(), fdrtest::reachable_count(edges, A, true));
+  }
+  FDR_CHECK(!registry.blast_radius(A).truncated);
+
+  // The reproduction: X contained by A would create X<A<C<D<Z, which is four
+  // edges deep, one beyond the ceiling. It must be refused for that reason, and
+  // the refusal must report the depth it measured.
+  const std::vector<FailureDomainId> extra = create_domains(registry, fixture, "x", 3, 300);
+  const FailureDomainId X = extra[0];
+  const FailureDomainId Y = extra[1];
+  const FailureDomainId P = extra[2];
+  const RegistryGeneration before = registry.generation();
+  const Outcome refused = add_relation(registry, fixture, X, A, 400);
+  FDR_CHECK_EQ(refused.code, OutcomeCode::InvalidHierarchy);
+  FDR_CHECK_MSG(refused.message.find("max_hierarchy_depth") != std::string::npos, refused.message);
+  FDR_CHECK_MSG(reports_ceiling(refused, limits.max_hierarchy_depth, 4),
+                "the refusal did not report the measured depth: " + refused.message);
+  FDR_CHECK(registry.generation() == before);
+  FDR_CHECK(!has_edge(registry, X, A, DomainRelationType::ContainedBy));
+  FDR_CHECK_EQ(registry.ancestors(X).size(), std::size_t{0});
+  FDR_CHECK_EQ(registry.relations_of(X).size(), std::size_t{0});
+
+  // Exactly at the ceiling commits: X<C is X<C<D<Z, three edges deep.
+  FDR_CHECK_EQ(add_relation(registry, fixture, X, C, 401).code, OutcomeCode::Committed);
+  {
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(registry);
+    FDR_CHECK_EQ(fdrtest::longest_chain(edges, X, true), limits.max_hierarchy_depth);
+    FDR_CHECK_EQ(fdrtest::max_containment_depth(edges), limits.max_hierarchy_depth);
+    FDR_CHECK_EQ(registry.ancestors(X), sorted_ids({C, D, Z}));
+    FDR_CHECK_EQ(registry.ancestors(X).size(), fdrtest::reachable_count(edges, X, true));
+  }
+
+  // One level beyond the ceiling is refused: Y<X would be four edges deep.
+  const RegistryGeneration at_limit = registry.generation();
+  const Outcome beyond = add_relation(registry, fixture, Y, X, 402);
+  FDR_CHECK_EQ(beyond.code, OutcomeCode::InvalidHierarchy);
+  FDR_CHECK_MSG(reports_ceiling(beyond, limits.max_hierarchy_depth, 4),
+                "the refusal did not report the measured depth: " + beyond.message);
+  FDR_CHECK(registry.generation() == at_limit);
+  FDR_CHECK(!has_edge(registry, Y, X, DomainRelationType::ContainedBy));
+  FDR_CHECK_EQ(registry.ancestors(Y).size(), std::size_t{0});
+
+  // An unrelated sibling edge still commits: P contained by a fresh domain
+  // shares no chain with the diamond, so it is one edge deep.
+  const std::vector<FailureDomainId> siblings = create_domains(registry, fixture, "s", 2, 500);
+  FDR_CHECK_EQ(add_relation(registry, fixture, siblings[0], siblings[1], 505).code,
+               OutcomeCode::Committed);
+  FDR_CHECK_EQ(fdrtest::longest_chain(fdrtest::containment_edges(registry), siblings[0], true),
+               std::size_t{1});
+
+  // Interaction with cycle detection. The depth rule is a bound, not a
+  // substitute for acyclicity: a containment closure whose chain fits under the
+  // ceiling is still rejected as a cycle, so the corrected measurement cannot
+  // mask one.
+  const std::vector<FailureDomainId> ring = create_domains(registry, fixture, "r", 2, 600);
+  FDR_CHECK_EQ(add_relation(registry, fixture, ring[0], ring[1], 610).code, OutcomeCode::Committed);
+  {
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(registry);
+    FDR_CHECK(fdrtest::would_close_cycle(edges, ring[1], ring[0]));
+    // The chain through the closing edge fits exactly at the ceiling, so the
+    // depth rule lets it through and the cycle rule is the one that answers.
+    FDR_CHECK_EQ(fdrtest::depth_through(edges, ring[1], ring[0]), limits.max_hierarchy_depth);
+  }
+  const RegistryGeneration ring_before = registry.generation();
+  const Outcome cycle = add_relation(registry, fixture, ring[1], ring[0], 611);
+  FDR_CHECK_EQ(cycle.code, OutcomeCode::CycleRejected);
+  FDR_CHECK(registry.generation() == ring_before);
+  FDR_CHECK(!has_edge(registry, ring[1], ring[0], DomainRelationType::ContainedBy));
+
+  // The same acyclicity question for a directed type the ceiling does not apply
+  // to: the closure is rejected as a cycle whatever the containment depth is.
+  const std::vector<FailureDomainId> depends = create_domains(registry, fixture, "d", 3, 620);
+  FDR_CHECK_EQ(add_relation(registry, fixture, depends[0], depends[1], 612,
+                            DomainRelationType::DependsOn)
+                   .code,
+               OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, depends[1], depends[2], 613,
+                            DomainRelationType::DependsOn)
+                   .code,
+               OutcomeCode::Committed);
+  const RegistryGeneration depends_before = registry.generation();
+  FDR_CHECK_EQ(add_relation(registry, fixture, depends[2], depends[0], 614,
+                            DomainRelationType::DependsOn)
+                   .code,
+               OutcomeCode::CycleRejected);
+  FDR_CHECK(registry.generation() == depends_before);
+
+  // A closing edge that would also exceed the ceiling is refused by the depth
+  // rule, which is evaluated first; the edge is absent either way, so no cycle
+  // is created and the state stays valid. The depth such an edge is measured at
+  // is the chain above the container plus the same chain below the contained
+  // domain, so a closure of a three-edge chain is measured seven edges deep: an
+  // inflated number, but a refusal either way, and the refusal names the number
+  // it measured.
+  const std::vector<FailureDomainId> closed = create_domains(registry, fixture, "c", 4, 700);
+  FDR_CHECK_EQ(add_relation(registry, fixture, closed[0], closed[1], 720).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, closed[1], closed[2], 721).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, closed[2], closed[3], 722).code, OutcomeCode::Committed);
+  {
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(registry);
+    FDR_CHECK(fdrtest::would_close_cycle(edges, closed[3], closed[0]));
+    FDR_CHECK_EQ(fdrtest::depth_through(edges, closed[3], closed[0]), std::size_t{7});
+  }
+  const RegistryGeneration closed_before = registry.generation();
+  const Outcome deep_cycle = add_relation(registry, fixture, closed[3], closed[0], 723);
+  FDR_CHECK_EQ(deep_cycle.code, OutcomeCode::InvalidHierarchy);
+  FDR_CHECK_MSG(reports_ceiling(deep_cycle, limits.max_hierarchy_depth, 7),
+                "the refusal did not report the measured depth: " + deep_cycle.message);
+  FDR_CHECK(registry.generation() == closed_before);
+  FDR_CHECK(!has_edge(registry, closed[3], closed[0], DomainRelationType::ContainedBy));
+
+  // Interaction with max_ancestor_walk: a correct depth measurement does not
+  // replace the probe budget. In a registry whose walk bound is two, an edge
+  // that is inside the ceiling is still refused when the acyclicity probe cannot
+  // finish, and the refusal names the probe bound.
+  {
+    RegistryLimits small = RegistryLimits::defaults();
+    small.max_hierarchy_depth = 2;
+    small.max_ancestor_walk = 2;
+    FDR_CHECK_MSG(small.validate().ok, small.validate().message);
+    Fixture bounded = make_fixture(small);
+    require_fixture(*bounded.registry, bounded);
+    Registry& other = *bounded.registry;
+    const std::vector<FailureDomainId> bushy = create_domains(other, bounded, "b", 4, 800);
+    for (std::size_t index = 1; index < bushy.size(); ++index) {
+      FDR_CHECK_EQ(add_relation(other, bounded, bushy[0], bushy[index],
+                                static_cast<std::uint64_t>(810 + index))
+                       .code,
+                   OutcomeCode::Committed);
+    }
+    const std::vector<FailureDomainId> fresh = create_domains(other, bounded, "f", 1, 830);
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(other);
+    // One level deep, so inside the ceiling, but proving acyclicity means
+    // visiting four domains and the walk bound is two.
+    FDR_CHECK_EQ(fdrtest::depth_through(edges, fresh[0], bushy[0]), small.max_hierarchy_depth);
+    const Outcome probe_refusal = add_relation(other, bounded, fresh[0], bushy[0], 840);
+    FDR_CHECK_EQ(probe_refusal.code, OutcomeCode::InvalidHierarchy);
+    FDR_CHECK_MSG(probe_refusal.message.find("max_ancestor_walk") != std::string::npos,
+                  "a bounded probe was not reported as bounded: " + probe_refusal.message);
+    std::string why;
+    FDR_CHECK_MSG(other.validate_state(&why), "the bounded registry did not validate: " + why);
+  }
+
+  // Insertion-order independence: the same five edges inserted in four different
+  // orders reach the same graph, the same measured depths and the same state
+  // digest, so the depth result is a property of the graph and not of the order
+  // it arrived in.
+  const std::pair<std::size_t, std::size_t> diamond[5] = {
+      {0, 1}, {0, 2}, {2, 3}, {3, 4}, {1, 4}};
+  const std::size_t orders[4][5] = {
+      {0, 1, 2, 3, 4}, {4, 3, 2, 1, 0}, {1, 3, 0, 4, 2}, {2, 4, 1, 3, 0}};
+  failure_domain_registry::StateDigest diamond_digest;
+  bool have_digest = false;
+  for (const auto& order : orders) {
+    Fixture ordered = make_fixture(limits);
+    require_fixture(*ordered.registry, ordered);
+    const std::vector<FailureDomainId> ids = create_domains(*ordered.registry, ordered, "o", 5, 900);
+    for (std::size_t position = 0; position < 5; ++position) {
+      const std::size_t index = order[position];
+      const Outcome outcome =
+          add_relation(*ordered.registry, ordered, ids[diamond[index].first],
+                       ids[diamond[index].second], static_cast<std::uint64_t>(950 + position));
+      FDR_CHECK_MSG(outcome.code == OutcomeCode::Committed,
+                    "an edge of a legal diamond was refused: " + outcome.message);
+    }
+    const std::vector<fdrtest::ContainmentEdge> edges =
+        fdrtest::containment_edges(*ordered.registry);
+    FDR_CHECK_EQ(edges.size(), std::size_t{5});
+    FDR_CHECK_EQ(fdrtest::longest_chain(edges, ids[0], true), std::size_t{3});
+    FDR_CHECK_EQ(fdrtest::max_containment_depth(edges), limits.max_hierarchy_depth);
+    const failure_domain_registry::StateDigest digest = ordered.registry->state_digest();
+    if (have_digest) {
+      FDR_CHECK_MSG(digest == diamond_digest,
+                    "the same edge set in another order reached another digest");
+    } else {
+      diamond_digest = digest;
+      have_digest = true;
+    }
+  }
+  FDR_CHECK(have_digest);
+
+  std::string why;
+  FDR_CHECK_MSG(registry.validate_state(&why), "the registry did not validate: " + why);
+}
+
+FDR_TEST_CASE(hierarchy, multi_child_paths_are_measured_by_the_longest_chain) {
+  RegistryLimits limits = RegistryLimits::defaults();
+  limits.max_hierarchy_depth = 3;
+  limits.max_ancestor_walk = 1024;
+  Fixture fixture = make_fixture(limits);
+  require_fixture(*fixture.registry, fixture);
+  Registry& registry = *fixture.registry;
+
+  // The descendant-side mirror of the case above: X contains M and N, the route
+  // down to W is X<M<K<W through one child and X<N<W through the other, so the
+  // real longest chain below X is three while a hop count would say two.
+  const std::vector<FailureDomainId> chain = create_domains(registry, fixture, "down", 5, 100);
+  const FailureDomainId M = chain[0];
+  const FailureDomainId N = chain[1];
+  const FailureDomainId K = chain[2];
+  const FailureDomainId W = chain[3];
+  const FailureDomainId X = chain[4];
+  FDR_CHECK_EQ(add_relation(registry, fixture, M, X, 200).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, N, X, 201).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, K, M, 202).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, W, K, 203).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(add_relation(registry, fixture, W, N, 204).code, OutcomeCode::Committed);
+  {
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(registry);
+    FDR_CHECK_EQ(fdrtest::longest_chain(edges, X, false), std::size_t{3});
+    FDR_CHECK_EQ(fdrtest::max_containment_depth(edges), limits.max_hierarchy_depth);
+    // The two children really do have descendant depths that differ.
+    FDR_CHECK_EQ(fdrtest::longest_chain(edges, M, false), std::size_t{2});
+    FDR_CHECK_EQ(fdrtest::longest_chain(edges, N, false), std::size_t{1});
+    // The read walk returns every descendant, not only the longest route.
+    FDR_CHECK_EQ(registry.descendants(X), sorted_ids({M, N, K, W}));
+    FDR_CHECK_EQ(registry.descendants(X).size(), fdrtest::reachable_count(edges, X, false));
+  }
+
+  // A container one level above X would create a chain four edges deep, so it is
+  // refused for the ceiling - the descendant side is measured exactly like the
+  // ancestor side.
+  const std::vector<FailureDomainId> extra = create_domains(registry, fixture, "e", 2, 300);
+  const FailureDomainId container = extra[0];
+  const FailureDomainId other = extra[1];
+  const RegistryGeneration before = registry.generation();
+  const Outcome refused = add_relation(registry, fixture, X, container, 400);
+  FDR_CHECK_EQ(refused.code, OutcomeCode::InvalidHierarchy);
+  FDR_CHECK_MSG(reports_ceiling(refused, limits.max_hierarchy_depth, 4), refused.message);
+  FDR_CHECK(registry.generation() == before);
+  FDR_CHECK(!has_edge(registry, X, container, DomainRelationType::ContainedBy));
+  FDR_CHECK_EQ(registry.descendants(container).size(), std::size_t{0});
+
+  // Exactly at the ceiling commits: M contained by the new container makes the
+  // chain container<M<K<W, three edges below the new container.
+  {
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(registry);
+    FDR_CHECK_EQ(fdrtest::depth_through(edges, M, container), limits.max_hierarchy_depth);
+  }
+  FDR_CHECK_EQ(add_relation(registry, fixture, M, container, 401).code, OutcomeCode::Committed);
+  {
+    const std::vector<fdrtest::ContainmentEdge> edges = fdrtest::containment_edges(registry);
+    FDR_CHECK_EQ(fdrtest::longest_chain(edges, container, false), limits.max_hierarchy_depth);
+    FDR_CHECK_EQ(fdrtest::max_containment_depth(edges), limits.max_hierarchy_depth);
+  }
+
+  // One level beyond is still refused, now measured through the new route as
+  // well: X contained by a second fresh container would be four edges deep.
+  const RegistryGeneration at_limit = registry.generation();
+  const Outcome beyond = add_relation(registry, fixture, X, other, 402);
+  FDR_CHECK_EQ(beyond.code, OutcomeCode::InvalidHierarchy);
+  FDR_CHECK_MSG(reports_ceiling(beyond, limits.max_hierarchy_depth, 4), beyond.message);
+  FDR_CHECK(registry.generation() == at_limit);
+  FDR_CHECK(!has_edge(registry, X, other, DomainRelationType::ContainedBy));
+
+  std::string why;
+  FDR_CHECK_MSG(registry.validate_state(&why), "the registry did not validate: " + why);
 }
 
 int main(int argc, char** argv) { return fdrtest::run_all(argc, argv); }

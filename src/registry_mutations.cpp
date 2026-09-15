@@ -1020,8 +1020,10 @@ Outcome Registry::add_relation(const AddRelationRequest& request) {
     }
   }
   if (request.type == DomainRelationType::ContainedBy) {
-    const std::size_t depth = impl_->hierarchy_depth_above(request.target) + 1 +
-                              impl_->hierarchy_depth_below(request.source);
+    // The true longest chain through the edge being added, not a hop count: a
+    // multi-parent containment graph can reach one container by a short path and
+    // another by a long one, and only the longest path may decide the ceiling.
+    const std::size_t depth = impl_->containment_depth_through(request.source, request.target);
     if (depth > impl_->limits.max_hierarchy_depth) {
       Outcome outcome = Outcome::make(
           OutcomeCode::InvalidHierarchy,

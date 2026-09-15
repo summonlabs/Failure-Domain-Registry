@@ -16,7 +16,7 @@ namespace failure_domain_registry {
 /// Semantic version of the library itself.
 inline constexpr std::uint32_t kVersionMajor = 1;
 inline constexpr std::uint32_t kVersionMinor = 0;
-inline constexpr std::uint32_t kVersionPatch = 0;
+inline constexpr std::uint32_t kVersionPatch = 1;
 
 /// Version of the persisted state container written by save().
 inline constexpr std::uint32_t kStateFormatVersion = 1;

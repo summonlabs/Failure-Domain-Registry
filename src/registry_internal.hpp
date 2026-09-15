@@ -42,6 +42,12 @@ namespace failure_domain_registry {
 /// Index of the fixed-size lifecycle tables. Enum values are 1..7.
 inline constexpr std::size_t kLifecycleSlots = 8;
 
+/// Direction of a containment-chain walk. TowardsContainers follows the
+/// containers of a domain (the domains it is CONTAINED_BY); TowardsContained
+/// follows the domains it contains. A typed direction is used instead of a flag
+/// so a caller cannot silently measure the wrong side of an edge.
+enum class ContainmentDirection { TowardsContainers, TowardsContained };
+
 struct RegistryState {
   CoordinatorEpoch epoch{};
   RegistryGeneration generation{};
@@ -188,9 +194,20 @@ struct Registry::Impl {
   Outcome check_record_size(const FailureDomain& record) const;
   Outcome check_record_size(const Membership& record) const;
   Outcome check_record_size(const DomainRelation& record) const;
-  /// Longest containment chain above (respectively below) a domain.
-  std::size_t hierarchy_depth_above(const FailureDomainId& id) const;
-  std::size_t hierarchy_depth_below(const FailureDomainId& id) const;
+  /// True longest containment chain, in edges, that a CONTAINED_BY edge from
+  /// the contained domain (source) to its container (target) would create: the
+  /// longest chain above the target, plus the new edge, plus the longest chain
+  /// below the source. Both sides are exact for every state this runtime can
+  /// produce; each saturates at max_hierarchy_depth + 1 so the walk stays
+  /// bounded, which keeps the caller's comparison against max_hierarchy_depth
+  /// exact.
+  std::size_t containment_depth_through(const FailureDomainId& source,
+                                        const FailureDomainId& target) const;
+  /// Longest containment chain, in edges, from a domain in one direction,
+  /// computed exactly over the acyclic containment subgraph and saturated at
+  /// ceiling + 1.
+  std::size_t containment_chain_depth(const FailureDomainId& id, ContainmentDirection direction,
+                                      std::size_t ceiling) const;
 
   void bump_generation();
   StateDigest compute_state_digest() const;

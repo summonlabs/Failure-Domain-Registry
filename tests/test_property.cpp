@@ -26,9 +26,11 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "failure_domain_registry/failure_domain_registry.hpp"
+#include "support/containment_probe.hpp"
 #include "support/test_harness.hpp"
 #include "support/test_process.hpp"
 
@@ -58,6 +60,9 @@ IdBytes entity_bytes(std::uint32_t index) {
 /// to install a grant, establish an epoch and attach an incarnation before any
 /// mutation is authorized.
 struct Fixture {
+  explicit Fixture(RegistryLimits limits_in = RegistryLimits::defaults())
+      : registry(limits_in), limits(limits_in) {}
+
   Registry registry;
   RegistryLimits limits;
   PublisherId publisher;
@@ -127,6 +132,19 @@ void require_indexes_match(Registry& registry, const std::string& context) {
       FDR_CHECK_EQ(direct->domain, domain.id);
     }
   }
+
+  // The containment ceiling bounds the true longest chain, measured here by an
+  // independent topological pass over the graph read back from the public
+  // relation query. A graph that is deeper than the ceiling, or that holds a
+  // containment cycle, is a failure whatever any single mutation reported.
+  const std::vector<fdrtest::ContainmentEdge> containment = fdrtest::containment_edges(registry);
+  FDR_CHECK_MSG(!fdrtest::containment_graph_has_cycle(containment),
+                context + ": the containment graph holds a cycle");
+  const std::size_t deepest = fdrtest::max_containment_depth(containment);
+  FDR_CHECK_MSG(deepest <= registry.limits().max_hierarchy_depth,
+                context + ": the containment graph is " + std::to_string(deepest) +
+                    " deep, beyond max_hierarchy_depth " +
+                    std::to_string(registry.limits().max_hierarchy_depth));
 }
 
 /// No entity may hold two current memberships of the same exclusive class.
@@ -834,6 +852,149 @@ FDR_TEST_CASE(property, persistence_round_trip_preserves_the_state) {
       FDR_CHECK_MSG(recovered.has_value(), "a membership did not survive the round trip");
       FDR_CHECK_EQ(recovered->canonical_form(), membership.canonical_form());
     }
+  }
+}
+
+FDR_TEST_CASE(property, the_hierarchy_ceiling_bounds_the_true_longest_chain) {
+  // One randomized schedule of CONTAINED_BY attempts over a twelve-domain graph.
+  // Every attempt is decided first by an independent model of the same graph
+  // (support/containment_probe.hpp), and the registry's answer has to be the
+  // model's answer:
+  //   * the edge would close a cycle      -> CycleRejected;
+  //   * the edge would exceed the ceiling -> InvalidHierarchy naming it, with
+  //                                          nothing committed;
+  //   * otherwise                         -> Committed or Idempotent.
+  // require_indexes_match then re-measures the graph the registry actually holds
+  // after every attempt, so a state deeper than the ceiling could not pass even
+  // if a single answer were wrong.
+  RegistryLimits limits = RegistryLimits::defaults();
+  limits.max_hierarchy_depth = 4;
+  limits.max_ancestor_walk = 128;
+  FDR_CHECK_MSG(limits.validate().ok, limits.validate().message);
+
+  const std::uint64_t seed = 20260915u;
+  Fixture fixture(limits);
+  build_fixture(fixture, seed);
+  Driver driver(fixture, seed);
+
+  const std::size_t kDomains = 12;
+  const auto create_domains = [&](Registry& registry, Driver& creator) {
+    std::vector<FailureDomainId> ids;
+    for (std::size_t index = 0; index < kDomains; ++index) {
+      CreateDomainRequest request;
+      request.attempt = creator.next_attempt();
+      request.authority = creator.authority();
+      request.domain_class = DomainClassRef(DomainClass::Rack);
+      request.administrative_scope = "dc1";
+      request.identity_key = "depth-" + std::to_string(index);
+      request.name = "depth-" + std::to_string(index);
+      request.provenance = creator.provenance(0);
+      const Outcome outcome = registry.create_domain(request);
+      if (outcome.code != OutcomeCode::Committed || !outcome.domain.has_value()) {
+        ::fdrtest::fail(__FILE__, __LINE__,
+                        "depth domain " + std::to_string(index) + " was refused: " + outcome.message);
+      }
+      ids.push_back(*outcome.domain);
+    }
+    return ids;
+  };
+  const std::vector<FailureDomainId> ids = create_domains(fixture.registry, driver);
+
+  fdrtest::Rng rng(seed ^ 0x9E3779B97F4A7C15ull);
+  std::vector<std::pair<FailureDomainId, FailureDomainId>> committed;
+  std::size_t ceiling_refusals = 0;
+  for (std::size_t step = 0; step < 160; ++step) {
+    const FailureDomainId source = ids[rng.below(ids.size())];
+    const FailureDomainId target = ids[rng.below(ids.size())];
+    if (source == target) {
+      continue;
+    }
+    const std::vector<fdrtest::ContainmentEdge> before =
+        fdrtest::containment_edges(fixture.registry);
+    const bool closes_cycle = fdrtest::would_close_cycle(before, source, target);
+    const std::size_t depth = fdrtest::depth_through(before, source, target);
+    const RegistryGeneration generation = fixture.registry.generation();
+
+    AddRelationRequest request;
+    request.attempt = driver.next_attempt();
+    request.authority = driver.authority();
+    request.source = source;
+    request.target = target;
+    request.type = DomainRelationType::ContainedBy;
+    request.provenance = driver.provenance(0);
+    const Outcome outcome = fixture.registry.add_relation(request);
+
+    const std::string context = "seed=" + std::to_string(seed) + " step=" + std::to_string(step);
+    // The ceiling is measured before the acyclicity probe, so an edge that would
+    // both deepen the hierarchy beyond the ceiling and close a cycle is answered
+    // as over-deep; the model has to mirror that order to predict the answer.
+    if (depth > limits.max_hierarchy_depth) {
+      FDR_CHECK_MSG(outcome.code == OutcomeCode::InvalidHierarchy,
+                    context + ": an edge " + std::to_string(depth) + " deep was answered " +
+                        outcome.message);
+      FDR_CHECK_MSG(outcome.message.find("max_hierarchy_depth") != std::string::npos,
+                    context + ": the ceiling refusal did not name the ceiling: " + outcome.message);
+      FDR_CHECK_MSG(fixture.registry.generation() == generation,
+                    context + ": a refused over-deep edge advanced the generation");
+      ++ceiling_refusals;
+    } else if (closes_cycle) {
+      FDR_CHECK_MSG(outcome.code == OutcomeCode::CycleRejected,
+                    context + ": a closing edge was answered " + outcome.message);
+    } else {
+      FDR_CHECK_MSG(outcome.code == OutcomeCode::Committed ||
+                        outcome.code == OutcomeCode::Idempotent,
+                    context + ": a legal edge " + std::to_string(depth) + " deep was answered " +
+                        outcome.message);
+      if (outcome.code == OutcomeCode::Committed) {
+        committed.emplace_back(source, target);
+      }
+    }
+    require_indexes_match(fixture.registry, context);
+  }
+  FDR_CHECK_MSG(committed.size() >= 6,
+                "the schedule committed only " + std::to_string(committed.size()) + " edges");
+  FDR_CHECK_MSG(ceiling_refusals > 0, "the schedule never reached the ceiling");
+
+  // Every chain the registry holds is fully walkable: the ceiling is below the
+  // walk bound here, so no read may truncate.
+  const std::vector<fdrtest::ContainmentEdge> graph = fdrtest::containment_edges(fixture.registry);
+  FDR_CHECK_MSG(fdrtest::max_containment_depth(graph) >= 2,
+                "the schedule never built a chain worth measuring");
+  for (const FailureDomainId& id : ids) {
+    FDR_CHECK_EQ(fixture.registry.ancestors(id).size(), fdrtest::reachable_count(graph, id, true));
+    FDR_CHECK_EQ(fixture.registry.descendants(id).size(),
+                 fdrtest::reachable_count(graph, id, false));
+  }
+  const StateDigest digest = fixture.registry.state_digest();
+
+  // Order independence: the committed edge set inserted in the opposite order
+  // reaches the same graph and the same state digest. A subset of an acyclic,
+  // chain-compliant edge set is itself chain-compliant, so every insertion has
+  // to be accepted.
+  {
+    Fixture replay(limits);
+    build_fixture(replay, seed);
+    Driver replay_driver(replay, seed ^ 0x51u);
+    const std::vector<FailureDomainId> replay_ids = create_domains(replay.registry, replay_driver);
+    FDR_CHECK_EQ(replay_ids, ids);
+    for (auto it = committed.rbegin(); it != committed.rend(); ++it) {
+      AddRelationRequest request;
+      request.attempt = replay_driver.next_attempt();
+      request.authority = replay_driver.authority();
+      request.source = it->first;
+      request.target = it->second;
+      request.type = DomainRelationType::ContainedBy;
+      request.provenance = replay_driver.provenance(0);
+      const Outcome outcome = replay.registry.add_relation(request);
+      FDR_CHECK_MSG(outcome.code == OutcomeCode::Committed,
+                    "a replayed edge was refused: " + outcome.message);
+    }
+    const std::vector<fdrtest::ContainmentEdge> replay_graph =
+        fdrtest::containment_edges(replay.registry);
+    FDR_CHECK_EQ(replay_graph.size(), committed.size());
+    FDR_CHECK_EQ(fdrtest::max_containment_depth(replay_graph),
+                 fdrtest::max_containment_depth(graph));
+    FDR_CHECK_EQ(replay.registry.state_digest(), digest);
   }
 }
 

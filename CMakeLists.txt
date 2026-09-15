@@ -11,7 +11,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(FailureDomainRegistry
-        VERSION 1.0.0
+        VERSION 1.0.1
         DESCRIPTION "Correlated-failure classification runtime for the Distributed Fabric Infrastructure stack"
         LANGUAGES CXX)
 

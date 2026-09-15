@@ -13,7 +13,7 @@ answers one question:
 It is a vendor-neutral C++20 library with a small set of executables. It has no
 third-party dependencies.
 
-Version 1.0.0. Persisted state format version 1. Wire protocol version 1.
+Version 1.0.1. Persisted state format version 1. Wire protocol version 1.
 
 ---
 
@@ -147,6 +147,13 @@ must stay acyclic and are rejected with `CYCLE_REJECTED` when they would close
 a cycle, while `SHARES_RISK_WITH` and `CORRELATED_WITH` are symmetric and may
 legitimately form arbitrary graphs. `CONTAINED_BY` additionally requires both
 endpoints to be containment classes; anything else is `INVALID_HIERARCHY`.
+
+Because containment is a graph, one domain may have several containers reached
+by routes of different lengths, and the depth of the hierarchy is the length of
+its **longest** containment chain. A `CONTAINED_BY` edge is refused with
+`INVALID_HIERARCHY` when the longest chain it would create exceeds
+`max_hierarchy_depth`; the chain is measured over the acyclic containment
+subgraph, so a shorter route to a domain never hides a longer one.
 
 ---
 
@@ -505,7 +512,9 @@ by every translation unit in `src/`.
 * Every resource bound the library validates is enforced by the path it names:
   `max_domains`, `max_memberships` (including on bulk publication),
   `max_relations`, `max_record_bytes` (measured with the real persistence
-  encoder), `max_hierarchy_depth` (measured when a containment edge is added),
+  encoder), `max_hierarchy_depth` (the longest containment chain the new edge
+  would create, measured over the acyclic containment subgraph when that edge is
+  added),
   `max_members_per_batch`, `max_query_set_cardinality`,
   `max_evidence_per_membership`, `max_metadata_*`, `max_history_query`,
   `max_publishers`, `max_coverage_declarations`,

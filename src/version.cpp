@@ -10,7 +10,12 @@
 namespace failure_domain_registry {
 
 std::string_view version_string() noexcept {
-  return "1.0.0";
+  // Composed once from the published constants, so the reported version can
+  // never claim a release other than the one this build was configured with.
+  static const std::string text = std::to_string(kVersionMajor) + "." +
+                                  std::to_string(kVersionMinor) + "." +
+                                  std::to_string(kVersionPatch);
+  return text;
 }
 
 } // namespace failure_domain_registry

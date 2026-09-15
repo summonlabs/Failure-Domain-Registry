@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <set>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "failure_domain_registry/digest.hpp"
 
@@ -577,58 +578,96 @@ Outcome Registry::Impl::check_record_size(const DomainRelation& record) const {
   return record_size_outcome(encoded_relation_bytes(record), limits.max_record_bytes);
 }
 
-std::size_t Registry::Impl::hierarchy_depth_above(const FailureDomainId& id) const {
-  std::vector<FailureDomainId> frontier{id};
-  std::set<FailureDomainId> seen;
-  seen.insert(id);
-  std::size_t depth = 0;
-  while (!frontier.empty() && depth <= limits.max_hierarchy_depth) {
-    std::vector<FailureDomainId> next;
-    for (const FailureDomainId& current : frontier) {
-      const auto it = state.parents.find(current);
-      if (it == state.parents.end()) {
-        continue;
+std::size_t Registry::Impl::containment_chain_depth(const FailureDomainId& id,
+                                                    ContainmentDirection direction,
+                                                    std::size_t ceiling) const {
+  // Exact longest path, in edges, from one domain in one containment direction.
+  //
+  // The containment subgraph is acyclic by construction -- add_relation refuses a
+  // CONTAINED_BY edge that would close a cycle, load() refuses an image that holds
+  // one, and validate_state reconciles both -- so the longest path is well defined
+  // and a memoised depth-first walk computes it exactly: a domain's depth is one
+  // plus the maximum over its successors, which is what stops a shorter sibling
+  // path from masking a longer one. A breadth-first level count cannot do this,
+  // because the level a domain is reached at is its shortest distance, not its
+  // longest chain.
+  //
+  // Two properties keep the walk bounded and deterministic:
+  //   * it saturates at ceiling + 1. A chain longer than the ceiling can only be
+  //     refused, so every value above the ceiling is decision-equivalent for the
+  //     caller, and the walk never grows past the part of the graph that can
+  //     still change the answer;
+  //   * it is iterative, so a deep chain cannot exhaust the call stack.
+  //
+  // A domain that is already on the walk stack can only appear if the containment
+  // graph holds a cycle, which no supported path can produce. Such a state is
+  // reported as maximally deep, so nothing is ever added to an invalid graph.
+  const std::size_t saturated = ceiling + 1;
+  struct Frame {
+    FailureDomainId id;
+    std::size_t next{0};
+    std::size_t best{0};
+  };
+  std::unordered_map<FailureDomainId, std::size_t> resolved;
+  std::unordered_set<FailureDomainId> active;
+  std::vector<Frame> frames;
+  frames.push_back(Frame{id, 0, 0});
+  active.insert(id);
+  while (!frames.empty()) {
+    Frame& frame = frames.back();
+    const std::vector<FailureDomainId>* edges = nullptr;
+    if (direction == ContainmentDirection::TowardsContainers) {
+      const auto it = state.parents.find(frame.id);
+      if (it != state.parents.end()) {
+        edges = &it->second;
       }
-      for (const FailureDomainId& parent : it->second) {
-        if (seen.insert(parent).second) {
-          next.push_back(parent);
+    } else {
+      const auto it = state.children.find(frame.id);
+      if (it != state.children.end()) {
+        edges = &it->second;
+      }
+    }
+    if (edges == nullptr || frame.next >= edges->size()) {
+      const std::size_t value = frame.best > saturated ? saturated : frame.best;
+      const FailureDomainId finished = frame.id;
+      frames.pop_back();
+      active.erase(finished);
+      resolved.emplace(finished, value);
+      if (!frames.empty()) {
+        const std::size_t through = value >= saturated ? saturated : value + 1;
+        if (through > frames.back().best) {
+          frames.back().best = through;
         }
       }
+      continue;
     }
-    if (next.empty()) {
-      break;
+    const FailureDomainId next = (*edges)[frame.next++];
+    const auto known = resolved.find(next);
+    if (known != resolved.end()) {
+      const std::size_t through = known->second >= saturated ? saturated : known->second + 1;
+      if (through > frame.best) {
+        frame.best = through;
+      }
+      continue;
     }
-    ++depth;
-    frontier.swap(next);
+    if (active.find(next) != active.end()) {
+      return saturated;
+    }
+    frames.push_back(Frame{next, 0, 0});
+    active.insert(next);
   }
-  return depth;
+  const auto start = resolved.find(id);
+  return start == resolved.end() ? saturated : start->second;
 }
 
-std::size_t Registry::Impl::hierarchy_depth_below(const FailureDomainId& id) const {
-  std::vector<FailureDomainId> frontier{id};
-  std::set<FailureDomainId> seen;
-  seen.insert(id);
-  std::size_t depth = 0;
-  while (!frontier.empty() && depth <= limits.max_hierarchy_depth) {
-    std::vector<FailureDomainId> next;
-    for (const FailureDomainId& current : frontier) {
-      const auto it = state.children.find(current);
-      if (it == state.children.end()) {
-        continue;
-      }
-      for (const FailureDomainId& child : it->second) {
-        if (seen.insert(child).second) {
-          next.push_back(child);
-        }
-      }
-    }
-    if (next.empty()) {
-      break;
-    }
-    ++depth;
-    frontier.swap(next);
-  }
-  return depth;
+std::size_t Registry::Impl::containment_depth_through(const FailureDomainId& source,
+                                                      const FailureDomainId& target) const {
+  const std::size_t ceiling = limits.max_hierarchy_depth;
+  const std::size_t above =
+      containment_chain_depth(target, ContainmentDirection::TowardsContainers, ceiling);
+  const std::size_t below =
+      containment_chain_depth(source, ContainmentDirection::TowardsContained, ceiling);
+  return above + 1 + below;
 }
 
 Outcome Registry::Impl::check_membership_limits() const {
