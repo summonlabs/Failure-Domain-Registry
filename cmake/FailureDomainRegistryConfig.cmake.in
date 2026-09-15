@@ -1,0 +1,24 @@
+@PACKAGE_INIT@
+
+# Failure Domain Registry package configuration.
+#
+# Consume it with:
+#
+#   find_package(FailureDomainRegistry CONFIG REQUIRED)
+#   target_link_libraries(app PRIVATE SummonSoftwareLabs::FailureDomainRegistry)
+#
+# Failure Domain Registry has no third-party dependencies. The Windows system
+# libraries the library links (ws2_32, setupapi) are recorded on the imported
+# target itself.
+
+include(CMakeFindDependencyMacro)
+
+set(FailureDomainRegistry_VERSION "@PROJECT_VERSION@")
+
+include("${CMAKE_CURRENT_LIST_DIR}/FailureDomainRegistryTargets.cmake")
+
+# Convenience for consumers that add the headers to their own include path
+# instead of linking the imported target.
+set_and_check(FailureDomainRegistry_INCLUDE_DIRS "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+
+check_required_components(FailureDomainRegistry)
