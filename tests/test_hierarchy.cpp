@@ -747,16 +747,28 @@ FDR_TEST_CASE(hierarchy, the_idempotency_window_forgets_the_oldest_attempt_first
 // Bounded walks
 // ---------------------------------------------------------------------------
 
-FDR_TEST_CASE(hierarchy, hierarchy_walks_stop_at_max_ancestor_walk) {
+FDR_TEST_CASE(hierarchy, hierarchy_walks_are_complete_under_the_cross_validated_bounds) {
+  // The walk bound and the depth ceiling are cross-validated: a walk bound below
+  // the ceiling could truncate silently, so validate() refuses the pair rather
+  // than accepting a configuration that lies.
+  RegistryLimits invalid = RegistryLimits::defaults();
+  invalid.max_ancestor_walk = 4;
+  FDR_CHECK(!invalid.validate().ok);
+  FDR_CHECK(invalid.validate().message.find("max_ancestor_walk") != std::string::npos);
+
   RegistryLimits limits = RegistryLimits::defaults();
+  limits.max_hierarchy_depth = 4;
   limits.max_ancestor_walk = 4;
+  FDR_CHECK_MSG(limits.validate().ok, limits.validate().message);
   Fixture fixture = make_fixture(limits);
   require_fixture(*fixture.registry, fixture);
+  FDR_CHECK_EQ(fixture.registry->limits().max_hierarchy_depth, std::size_t{4});
   FDR_CHECK_EQ(fixture.registry->limits().max_ancestor_walk, std::size_t{4});
 
-  // An eight-deep containment chain, innermost first.
+  // A containment chain exactly as deep as the ceiling admits: five domains,
+  // innermost first.
   std::vector<FailureDomainId> chain;
-  for (std::uint8_t index = 0; index < 8; ++index) {
+  for (std::uint8_t index = 0; index < 5; ++index) {
     const DomainHandle handle = create_domain(*fixture.registry, fixture, DomainClass::Rack, "dc1",
                                               "rack-" + std::to_string(index),
                                               static_cast<std::uint64_t>(index) + 1u);
@@ -770,37 +782,44 @@ FDR_TEST_CASE(hierarchy, hierarchy_walks_stop_at_max_ancestor_walk) {
                  OutcomeCode::Committed);
   }
 
-  // The walk is bounded, and it stops exactly at the configured bound.
+  // Every walk is complete. The depth ceiling bounds the chain and the walk
+  // bound is at least the ceiling, so nothing truncates: the walk results are the
+  // whole reachable set, and they come back in identity order.
   const std::vector<FailureDomainId> ancestors = fixture.registry->ancestors(chain.front());
   FDR_CHECK_EQ(ancestors.size(), std::size_t{4});
   FDR_CHECK_EQ(ancestors, sorted_ids({chain[1], chain[2], chain[3], chain[4]}));
   const std::vector<FailureDomainId> descendants = fixture.registry->descendants(chain.back());
   FDR_CHECK_EQ(descendants.size(), std::size_t{4});
-  FDR_CHECK_EQ(descendants, sorted_ids({chain[3], chain[4], chain[5], chain[6]}));
+  FDR_CHECK_EQ(descendants, sorted_ids({chain[0], chain[1], chain[2], chain[3]}));
 
-  // Adding a child under the innermost domain needs a walk up the whole chain,
-  // which the bound refuses: the request is reported as an invalid hierarchy
-  // rather than as a cycle, because the probe could not decide.
+  // One level deeper would make the hierarchy deeper than the ceiling, so the
+  // edge is refused by the ceiling itself, before any acyclicity probe runs.
   const DomainHandle fresh = create_domain(*fixture.registry, fixture, DomainClass::Rack, "dc1",
                                            "rack-fresh", 50);
   FDR_CHECK_EQ(fresh.outcome.code, OutcomeCode::Committed);
   const RegistryGeneration generation = fixture.registry->generation();
-  const Outcome bounded = add_relation(*fixture.registry, fixture, fresh.id, chain.front(), 200);
-  FDR_CHECK_EQ(bounded.code, OutcomeCode::InvalidHierarchy);
-  FDR_CHECK(bounded.message.find("max_ancestor_walk") != std::string::npos);
+  // fresh is declared as a further container of the outermost domain, which is
+  // the edge that would make the hierarchy one level deeper than the ceiling.
+  const Outcome too_deep = add_relation(*fixture.registry, fixture, chain.back(), fresh.id, 200);
+  FDR_CHECK_EQ(too_deep.code, OutcomeCode::InvalidHierarchy);
+  FDR_CHECK(too_deep.message.find("max_hierarchy_depth") != std::string::npos);
   FDR_CHECK(fixture.registry->generation() == generation);
   FDR_CHECK(fixture.registry->ancestors(fresh.id).empty());
+  FDR_CHECK_EQ(fixture.registry->relations_of(fresh.id).size(), std::size_t{0});
 
-  // The blast radius of the outermost domain reports the same bound.
+  // The blast radius of the outermost domain reports itself as bounded instead
+  // of presenting a possibly incomplete list as complete.
   const BlastRadius radius = fixture.registry->blast_radius(chain.back());
   FDR_CHECK(radius.truncated);
   FDR_CHECK_EQ(radius.child_domains.size(), std::size_t{4});
 
-  // A relation that does not need the deep walk is still committed: the bound
-  // limits the probe, not the graph.
-  FDR_CHECK_EQ(add_relation(*fixture.registry, fixture, fresh.id, chain.back(), 201).code,
+  // An edge that does not deepen the hierarchy is still committed: the ceiling
+  // bounds the graph, not the number of edges, and a sibling at the same level
+  // is inside it.
+  FDR_CHECK_EQ(add_relation(*fixture.registry, fixture, fresh.id, chain[1], 201).code,
                OutcomeCode::Committed);
-  FDR_CHECK_EQ(fixture.registry->ancestors(fresh.id), sorted_ids({chain.back()}));
+  FDR_CHECK_EQ(fixture.registry->ancestors(fresh.id),
+               sorted_ids({chain[1], chain[2], chain[3], chain[4]}));
 
   std::string why;
   FDR_CHECK_MSG(fixture.registry->validate_state(&why), "the registry did not validate: " + why);
@@ -808,8 +827,9 @@ FDR_TEST_CASE(hierarchy, hierarchy_walks_stop_at_max_ancestor_walk) {
 
 FDR_TEST_CASE(hierarchy, a_deep_containment_chain_resolves_under_the_default_limits) {
   RegistryLimits limits = RegistryLimits::defaults();
-  // The default hierarchy depth is a configured ceiling that no walk consults;
-  // the walk is bounded by max_ancestor_walk.
+  // The default hierarchy ceiling is exactly the deepest chain a containment
+  // edge may build, and the walk bound is above it, so a depth-64 chain is both
+  // admitted and fully walkable.
   FDR_CHECK_EQ(limits.max_hierarchy_depth, std::size_t{64});
   FDR_CHECK_EQ(limits.max_ancestor_walk, std::size_t{1024});
   Fixture fixture = make_fixture(limits);

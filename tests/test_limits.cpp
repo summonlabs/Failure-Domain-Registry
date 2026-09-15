@@ -16,6 +16,7 @@
 // query set are all offered far past their bound, and the registry answers with
 // a ResourceLimit naming the bound rather than with work proportional to it.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -367,6 +368,13 @@ Outcome declare(Registry& registry, const AuthorityContext& authority, std::stri
 FailureDomainId domain_of(std::string_view scope, const DomainClassRef& domain_class,
                           std::string_view identity_key) {
   return failure_domain_registry::domain_id_for(scope, domain_class, identity_key);
+}
+
+/// The public walk results are ordered by identity, so an expectation written in
+/// dependency order has to be sorted before it can be compared.
+std::vector<FailureDomainId> sorted_ids(std::vector<FailureDomainId> ids) {
+  std::sort(ids.begin(), ids.end());
+  return ids;
 }
 
 std::string describe(const Outcome& outcome) {
@@ -1405,10 +1413,10 @@ FDR_TEST_CASE(limits, max_ancestor_walk_bounds_the_cycle_walk_and_reports_it) {
     return chain;
   };
 
-  // A hierarchy exactly as deep as the walk bound is fully walkable: the depth
-  // ceiling admits three domains in a chain, the closure of that chain is
+  // A hierarchy exactly as deep as the configured ceiling is fully walkable: the
+  // depth ceiling admits three domains in a chain, the closure of that chain is
   // evaluated rather than refused, and the read walks return every ancestor and
-  // every descendant because the two bounds are equal.
+  // every descendant because the walk bound is not below the ceiling.
   {
     RegistryLimits limits = RegistryLimits::defaults();
     limits.max_hierarchy_depth = 2;
@@ -1419,22 +1427,25 @@ FDR_TEST_CASE(limits, max_ancestor_walk_bounds_the_cycle_walk_and_reports_it) {
     const std::vector<FailureDomainId> chain = build_chain(*fixture.registry, fixture.authority(), 3);
     FDR_CHECK_EQ(chain.size(), std::size_t{3});
     // A CONTAINED_BY edge points from the contained domain to its container, so
-    // the innermost domain has the ancestors and the outermost the descendants,
-    // both in breadth-first order.
-    FDR_CHECK_EQ(fixture.registry->ancestors(chain[0]),
-                 std::vector<FailureDomainId>({chain[1], chain[2]}));
-    FDR_CHECK_EQ(fixture.registry->descendants(chain[2]),
-                 std::vector<FailureDomainId>({chain[1], chain[0]}));
+    // the innermost domain has the ancestors and the outermost the descendants.
+    // The public results come back in identity order.
+    FDR_CHECK_EQ(fixture.registry->ancestors(chain[0]), sorted_ids({chain[1], chain[2]}));
+    FDR_CHECK_EQ(fixture.registry->descendants(chain[2]), sorted_ids({chain[1], chain[0]}));
 
-    // Closing the chain is a real cycle, and the walk that proves it fits
-    // inside the bound, so the answer is the cycle and not a bounded probe.
+    // Closing the chain would be a real cycle, and it would also be deeper than
+    // the ceiling. The depth rule is evaluated first, so the answer is the
+    // ceiling rather than the probe - either way the edge is refused and leaves
+    // no trace. (A cycle over a chain that fits inside the ceiling is rejected as
+    // a cycle by the adversarial suite.)
     const Fingerprint before = Fingerprint::capture(*fixture.registry);
     const Outcome refused = add_relation(*fixture.registry, fixture.authority(), chain[2], chain[0],
                                          DomainRelationType::ContainedBy, "close",
                                          durable_provenance("inv"));
-    FDR_CHECK_EQ(refused.code, OutcomeCode::CycleRejected);
+    FDR_CHECK_EQ(refused.code, OutcomeCode::InvalidHierarchy);
+    FDR_CHECK_MSG(refused.message.find("max_hierarchy_depth") != std::string::npos,
+                  "the depth ceiling was not the reported reason: " + describe(refused));
     const std::string drift = before.drift(*fixture.registry);
-    FDR_CHECK_MSG(drift.empty(), "a refused cycle changed state: " + drift);
+    FDR_CHECK_MSG(drift.empty(), "a refused closing edge changed state: " + drift);
 
     // One containment level deeper than the configured ceiling is refused by
     // the ceiling itself, before any probe runs.
@@ -1516,13 +1527,15 @@ FDR_TEST_CASE(limits, max_ancestor_walk_bounds_the_cycle_walk_and_reports_it) {
   }
 }
 
-FDR_TEST_CASE(limits, bounds_that_are_validated_but_never_consulted_by_this_build) {
-  // Four configured bounds are accepted by validate() and then never read by
-  // any registry path: max_hierarchy_depth, max_record_bytes, max_history_query
-  // starts being enforced, this case says so instead of silently passing.
+FDR_TEST_CASE(limits, the_bounds_that_used_to_be_unenforced_are_enforced) {
+  // max_hierarchy_depth, max_record_bytes and max_history_query are consulted by
+  // the paths they name, so a configuration below the defaults actually bites
+  // instead of being accepted and then ignored.
   RegistryLimits limits = RegistryLimits::defaults();
   limits.max_hierarchy_depth = 1;
-  limits.max_record_bytes = 256;
+  // A plain domain record encodes to a few hundred bytes, so a one-kilobyte
+  // budget is below the default and still admits a normal record.
+  limits.max_record_bytes = 1024;
   limits.max_history_query = 1;
   limits.max_metadata_value_bytes = 4096;
   limits.max_metadata_bytes_per_record = 4096;
@@ -1533,9 +1546,10 @@ FDR_TEST_CASE(limits, bounds_that_are_validated_but_never_consulted_by_this_buil
   const DomainClassRef klass(DomainClass::Rack);
   const Provenance provenance = durable_provenance("inv");
 
-  // A containment chain deeper than max_hierarchy_depth is accepted.
+  // A containment chain exactly as deep as the configured ceiling commits: one
+  // edge between two domains.
   FailureDomainId previous;
-  for (std::size_t index = 0; index < 3; ++index) {
+  for (std::size_t index = 0; index < 2; ++index) {
     const std::string key = "deep-" + std::to_string(index);
     FDR_CHECK_EQ(declare_domain(registry, fixture.authority(), klass, "dc-deep", key, key,
                                "deep-d" + std::to_string(index), provenance).code,
@@ -1551,12 +1565,31 @@ FDR_TEST_CASE(limits, bounds_that_are_validated_but_never_consulted_by_this_buil
   }
   const FailureDomainId outermost = previous;
   const FailureDomainId innermost = domain_of("dc-deep", klass, "deep-0");
-  FDR_CHECK_EQ(registry.descendants(outermost).size(), std::size_t{2});
-  FDR_CHECK_EQ(registry.ancestors(innermost).size(), std::size_t{2});
+  FDR_CHECK_EQ(registry.descendants(outermost).size(), std::size_t{1});
+  FDR_CHECK_EQ(registry.ancestors(innermost).size(), std::size_t{1});
 
-  // A record far larger than max_record_bytes is accepted, because the metadata
-  // budget is the only record-size bound anything consults.
+  // One level deeper is refused by the ceiling itself, and the refusal leaves
+  // nothing behind.
   {
+    FDR_CHECK_EQ(declare_domain(registry, fixture.authority(), klass, "dc-deep", "deep-2", "deep-2",
+                               "deep-d2", provenance).code,
+                OutcomeCode::Committed);
+    const FailureDomainId beyond = domain_of("dc-deep", klass, "deep-2");
+    const Fingerprint before = Fingerprint::capture(registry);
+    const Outcome refused = add_relation(registry, fixture.authority(), outermost, beyond,
+                                        DomainRelationType::ContainedBy, "deep-r2", provenance);
+    FDR_CHECK_EQ(refused.code, OutcomeCode::InvalidHierarchy);
+    FDR_CHECK_MSG(refused.message.find("max_hierarchy_depth") != std::string::npos,
+                 "the depth ceiling was not the reported reason: " + describe(refused));
+    const std::string drift = before.drift(registry);
+    FDR_CHECK_MSG(drift.empty(), "a refused depth-ceiling edge changed state: " + drift);
+    FDR_CHECK(registry.ancestors(beyond).empty());
+  }
+
+  // A record whose real persisted encoding exceeds max_record_bytes is refused
+  // before it exists, and the refusal names the measured size.
+  {
+    const Fingerprint before = Fingerprint::capture(registry);
     CreateDomainRequest request;
     request.attempt = MutationAttempt{attempt_from("big"), RequestDigest{}};
     request.authority = fixture.authority();
@@ -1566,7 +1599,58 @@ FDR_TEST_CASE(limits, bounds_that_are_validated_but_never_consulted_by_this_buil
     request.name = "big-record";
     request.provenance = provenance;
     request.metadata = {metadata("blob", text_of(1000, 'v'))};
+    const Outcome refused = registry.create_domain(request);
+    FDR_CHECK_EQ(refused.code, OutcomeCode::ResourceLimit);
+    FDR_CHECK_MSG(refused.message.find("max_record_bytes") != std::string::npos,
+                 "the record-size bound was not the reported reason: " + describe(refused));
+    const std::string drift = before.drift(registry);
+    FDR_CHECK_MSG(drift.empty(), "a refused oversized record changed state: " + drift);
+    FDR_CHECK_EQ(registry.domain_count(), std::size_t{3});
+  }
+
+  // A record inside the budget still commits: the bound is a ceiling, not a
+  // blanket refusal.
+  {
+    CreateDomainRequest request;
+    request.attempt = MutationAttempt{attempt_from("fits"), RequestDigest{}};
+    request.authority = fixture.authority();
+    request.domain_class = klass;
+    request.administrative_scope = "dc-deep";
+    request.identity_key = "small-record";
+    request.name = "small-record";
+    request.provenance = provenance;
+    request.metadata = {metadata("blob", text_of(32, 'v'))};
     FDR_CHECK_EQ(registry.create_domain(request).code, OutcomeCode::Committed);
+  }
+
+  // History rendering is bounded by max_history_query: the newest entries are
+  // rendered and the rest are reported as truncated, never dropped silently.
+  {
+    FDR_CHECK_EQ(declare_domain(registry, fixture.authority(), klass, "dc-deep", "history-0",
+                               "history-0", "history-d0", provenance).code,
+                OutcomeCode::Committed);
+    const FailureDomainId history_target = domain_of("dc-deep", klass, "history-0");
+    FDR_CHECK_EQ(update_transition(registry, fixture.authority(), history_target,
+                                   DomainLifecycle::RevalidationRequired, "hist-t1").code,
+                OutcomeCode::Committed);
+    FDR_CHECK_EQ(update_transition(registry, fixture.authority(), history_target,
+                                   DomainLifecycle::Current, "hist-t2").code,
+                OutcomeCode::Committed);
+    const failure_domain_registry::Explanation explanation = registry.explain_domain(history_target);
+    std::size_t rendered = 0;
+    bool truncated = false;
+    for (const failure_domain_registry::ExplanationStep& step : explanation.steps) {
+      if (step.stage != "history") {
+        continue;
+      }
+      if (step.field == "truncated") {
+        truncated = true;
+        continue;
+      }
+      ++rendered;
+    }
+    FDR_CHECK_EQ(rendered, limits.max_history_query);
+    FDR_CHECK_MSG(truncated, "a bounded history read was not reported as truncated");
   }
 
   // Snapshots are not retained at all, so the retention bound has nothing to
@@ -1591,7 +1675,7 @@ FDR_TEST_CASE(limits, bounds_that_are_validated_but_never_consulted_by_this_buil
   }
 
   std::string why;
-  FDR_CHECK_MSG(registry.validate_state(&why), "the unenforced bounds broke the state: " + why);
+  FDR_CHECK_MSG(registry.validate_state(&why), "the enforced bounds broke the state: " + why);
 }
 
 // ---------------------------------------------------------------------------

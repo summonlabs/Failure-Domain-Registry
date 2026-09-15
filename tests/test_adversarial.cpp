@@ -1357,33 +1357,33 @@ FDR_TEST_CASE(adversarial, a_cycle_is_rejected_and_a_chain_past_the_walk_bound_i
     const std::string drift = before.drift(registry);
     FDR_CHECK_MSG(drift.empty(), "closing the permitted-depth chain changed state: " + drift);
   }
-  // One domain deeper and the same edge can no longer be evaluated: the walk
-  // bound is reported as an invalid hierarchy instead of being silently treated
-  // as "no cycle".
+  // One domain deeper and the depth ceiling itself refuses the edge: the chain
+  // already sits at max_hierarchy_depth, and a containment edge is measured when
+  // it is added. Because that ceiling bounds every chain, the read-only walks can
+  // never truncate: they always return the whole reachable set.
   {
     const std::string key = "deep-" + std::to_string(deepest);
     FDR_CHECK_EQ(declare_domain(registry, deep.session.authority(), rack, "dc-deep", key, key, key,
                                provenance).code,
                 OutcomeCode::Committed);
     const FailureDomainId last = domain_of("dc-deep", rack, key);
-    FDR_CHECK_EQ(add_relation(registry, deep.session.authority(), chain[deepest - 1], last,
-                             DomainRelationType::ContainedBy, "deep-extend", provenance).code,
-                OutcomeCode::Committed);
     const Fingerprint before = Fingerprint::capture(registry);
-    const Outcome refused = add_relation(registry, deep.session.authority(), last, chain[0],
-                                         DomainRelationType::ContainedBy, "deep-close-2", provenance);
+    const Outcome refused = add_relation(registry, deep.session.authority(), chain[deepest - 1],
+                                        last, DomainRelationType::ContainedBy, "deep-extend",
+                                        provenance);
     FDR_CHECK_EQ(refused.code, OutcomeCode::InvalidHierarchy);
-    FDR_CHECK_MSG(refused.message.find("max_ancestor_walk") != std::string::npos,
-                 "a bounded hierarchy walk was not reported as bounded: " + describe(refused));
+    FDR_CHECK_MSG(refused.message.find("max_hierarchy_depth") != std::string::npos,
+                 "the depth ceiling was not the reported reason: " + describe(refused));
     const std::string drift = before.drift(registry);
-    FDR_CHECK_MSG(drift.empty(), "a bounded hierarchy walk changed state: " + drift);
-    // The depth ceiling is enforced when an edge is added, so a chain can never
-    // be deeper than max_hierarchy_depth, and the read-only walks are therefore
-    // always complete: they cannot truncate, and they cannot recurse without
-    // bound.
+    FDR_CHECK_MSG(drift.empty(), "a refused depth-ceiling edge changed state: " + drift);
+    // The refused edge is not in the graph, so the new domain stays isolated and
+    // the chain is untouched and still fully walkable.
+    FDR_CHECK_EQ(registry.relations_of(last).size(), std::size_t{0});
+    FDR_CHECK_EQ(registry.descendants(last).size(), std::size_t{0});
     // Containment points from the contained domain to its container, so the
-    // outermost domain is the one with a full descendant set.
-    FDR_CHECK_EQ(registry.descendants(last).size(), deepest - 1);
+    // outermost domain is the one with a full descendant set, and the walk from
+    // the innermost domain reaches every container.
+    FDR_CHECK_EQ(registry.descendants(chain[deepest - 1]).size(), deepest - 1);
     FDR_CHECK_EQ(registry.ancestors(chain[0]).size(), deepest - 1);
   }
   std::string why;
@@ -1448,26 +1448,27 @@ FDR_TEST_CASE(adversarial, duplicate_memberships_are_malformed_idempotent_or_sha
                                  "second", AuthorityScope::unrestricted(),
                                  EvidenceClass::DirectAuthoritativeInfrastructure);
     FDR_CHECK_MSG(second.problem().empty(), "the second publisher did not attach: " + second.problem());
-    const Fingerprint before = Fingerprint::capture(registry);
+    const RegistryGeneration before_generation = registry.generation();
+    const std::size_t before_domains = registry.domain_count();
     const Outcome shared = attach_member(registry, second.authority(), domain.id, member, "a3", provenance);
-    // Corroboration is recorded, not discarded: the second publisher's
-    // attestation is added to the same record rather than being mistaken for an
-    // exact replay.
+    // Corroboration is recorded, not discarded: an equal-rank attestation from a
+    // different authority is a second claim about the same fact, so it is added
+    // to the one record rather than being mistaken for an exact replay.
     FDR_CHECK_EQ(shared.code, OutcomeCode::Committed);
     FDR_CHECK(shared.membership.has_value());
     FDR_CHECK_MSG(*shared.membership == membership_id,
                  "two publishers produced two membership ids for the same fact");
     FDR_CHECK_EQ(registry.membership_count(), std::size_t{1});
-    // Corroboration is a committed change that adds an evidence entry, so the
-    // registry generation is expected to move; what must not move is the number
-    // of membership records.
+    FDR_CHECK_EQ(registry.domain_count(), before_domains);
+    // Corroboration is a committed change: it adds an evidence entry and moves
+    // the registry generation. What must not move is the record count and the
+    // record identity.
+    FDR_CHECK(registry.generation() != before_generation);
     FDR_CHECK_EQ(registry.membership(*shared.membership)->live_evidence_count(), std::size_t{2});
-    const std::string drift = before.drift(registry);
-    FDR_CHECK_MSG(drift.empty(), "a shared membership changed the counts: " + drift);
 
     // The same publisher stating something different about the same key updates
-    // the one record and adds its corroboration, so the count still does not
-    // grow.
+    // the one record and adds its own attestation, so the count still does not
+    // grow while the evidence list does.
     const Outcome updated = attach_member(registry, second.authority(), domain.id, member, "a4",
                                           provenance, MembershipRole::Primary);
     FDR_CHECK_EQ(updated.code, OutcomeCode::Committed);
@@ -1476,8 +1477,9 @@ FDR_TEST_CASE(adversarial, duplicate_memberships_are_malformed_idempotent_or_sha
     FDR_CHECK(record.has_value());
     FDR_CHECK_EQ(record->lifecycle, MembershipLifecycle::Current);
     FDR_CHECK_EQ(record->role, MembershipRole::Primary);
-    FDR_CHECK_EQ(record->evidence.size(), std::size_t{2});
-    FDR_CHECK_EQ(record->generation, MembershipGeneration(2));
+    FDR_CHECK_EQ(record->evidence.size(), std::size_t{3});
+    FDR_CHECK_EQ(record->live_evidence_count(), std::size_t{3});
+    FDR_CHECK_EQ(record->generation, MembershipGeneration(3));
   }
   std::string why;
   FDR_CHECK_MSG(registry.validate_state(&why), "the duplicate membership cases broke the state: " + why);
@@ -1820,14 +1822,19 @@ FDR_TEST_CASE(adversarial, exhausting_every_bound_leaves_a_consistent_registry) 
   }
 
   // Publications: a batch of one is inside max_members_per_batch, a batch of two
-  // is not, and the oversized batch is refused as a whole.
+  // is not, and every refusal is whole-publication rather than partial.
   {
+    const Fingerprint before = Fingerprint::capture(registry);
     MembershipBatchRequest request =
         publication(fixture.session.authority(), first.id, {member_c}, "p1");
-    // max_memberships is enforced on the publication path too, and the whole
-    // publication is refused rather than partially applied.
+    // The bulk path consults max_memberships exactly like the single-attach
+    // path does, and the publication is refused before anything is applied.
     FDR_CHECK_EQ(registry.publish_memberships(request).code, OutcomeCode::ResourceLimit);
     FDR_CHECK_EQ(registry.membership_count(), std::size_t{2});
+    const std::string drift = before.drift(registry);
+    FDR_CHECK_MSG(drift.empty(), "a refused publication changed state: " + drift);
+  }
+  {
     MembershipBatchRequest oversized =
         publication(fixture.session.authority(), first.id, {member_c}, "p2");
     MembershipBatchEntry extra;
@@ -1838,16 +1845,18 @@ FDR_TEST_CASE(adversarial, exhausting_every_bound_leaves_a_consistent_registry) 
     extra.dependency = DependencySemantics::AnyDependencyFailureAffectsMember;
     extra.provenance = provenance;
     oversized.entries.push_back(std::move(extra));
+    const Fingerprint before = Fingerprint::capture(registry);
+    // Two entries exceed max_members_per_batch, which is checked first; the batch
+    // bound and the membership bound both refuse the whole publication.
     FDR_CHECK_EQ(registry.publish_memberships(oversized).code, OutcomeCode::ResourceLimit);
+    const std::string drift = before.drift(registry);
+    FDR_CHECK_MSG(drift.empty(), "a refused oversized publication changed state: " + drift);
   }
 
-  // The bulk path is the one place that does not consult max_memberships: the
-  // single-attach path refused the third membership above, while publishing one
-  // new member here takes the count past the configured bound. This is the
-  // behaviour that ships and it is reported as a defect rather than hidden.
-  FDR_CHECK_EQ(registry.membership_count(), std::size_t{3});
-  FDR_CHECK_MSG(registry.membership_count() > limits.max_memberships,
-               "the bulk publication path started honouring max_memberships; this case needs rereading");
+  // No publication path can take the registry past the configured bound: the
+  // count sits exactly at max_memberships and stays there.
+  FDR_CHECK_EQ(registry.membership_count(), limits.max_memberships);
+  FDR_CHECK_EQ(registry.membership_count(), std::size_t{2});
 
   // Relations: one edge fits, the second does not.
   FDR_CHECK_EQ(add_relation(registry, fixture.session.authority(), first.id, second.id,
@@ -1900,9 +1909,10 @@ FDR_TEST_CASE(adversarial, exhausting_every_bound_leaves_a_consistent_registry) 
     FDR_CHECK_EQ(truncated.state, IndependenceState::Unknown);
   }
   FDR_CHECK_EQ(registry.domain_count(), std::size_t{2});
-  // Three memberships, one past the configured bound, because the bulk path
-  // above never consulted it.
-  FDR_CHECK_EQ(registry.membership_count(), std::size_t{3});
+  // The count never went past the configured bound: the bulk publication path
+  // consults max_memberships exactly like the single-attach path does.
+  FDR_CHECK_EQ(registry.membership_count(), std::size_t{2});
+  FDR_CHECK_EQ(registry.membership_count(), limits.max_memberships);
   std::string why;
   FDR_CHECK_MSG(registry.validate_state(&why), "resource exhaustion left the state inconsistent: " + why);
 }

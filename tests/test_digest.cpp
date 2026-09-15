@@ -872,12 +872,17 @@ FDR_TEST_CASE(digest, canonical_forms_are_deterministic_and_field_sensitive) {
     FDR_CHECK(relation_changes(other));
   }
   {
-    // Unlike a domain or a membership, a relation's canonical form includes the
-    // registry generation and epoch it was created at. That is the behaviour
-    // this build has, so it is pinned rather than assumed away.
+    // A relation's canonical form excludes the registry generation it was
+    // created at, exactly as a domain's and a membership's do: creation
+    // bookkeeping is process-local and never moves the semantic digest.
     DomainRelation other = relation;
     other.created_at = RegistryGeneration(10);
-    FDR_CHECK(relation_changes(other));
+    FDR_CHECK(!relation_changes(other));
+  }
+  {
+    DomainRelation other = relation;
+    other.created_epoch = CoordinatorEpoch(11);
+    FDR_CHECK(!relation_changes(other));
   }
 }
 
@@ -1092,12 +1097,13 @@ FDR_TEST_CASE(digest, state_digest_is_independent_of_arrival_order) {
   FDR_CHECK_MSG(second.validate_state(&why), "second registry is inconsistent: " + why);
 }
 
-FDR_TEST_CASE(digest, state_digest_is_order_sensitive_to_evidence_publication) {
-  // The same two memberships published in opposite order. The evidence
-  // generation is handed out by one per-registry counter and is part of the
-  // membership canonical form, so this build reaches two different digests -
-  // which contradicts the arrival-order sentence in digest.hpp. The divergence
-  // is pinned here instead of being papered over.
+FDR_TEST_CASE(digest, state_digest_excludes_the_per_registry_evidence_counter) {
+  // The same two memberships published in opposite order. Each publication draws
+  // the next value from one per-registry evidence counter, and that counter is
+  // deliberately excluded from every canonical form, so arrival order cannot leak
+  // into the semantic digest through the evidence generation: both registries
+  // reach the same digest, and the records still carry their own evidence
+  // generations.
   const Provenance durable = provenance_of(ProvenanceSource::OperatorInventory,
                                            EvidenceClass::DirectAuthoritativeInfrastructure,
                                            TruthClass::Real, "inv-1");

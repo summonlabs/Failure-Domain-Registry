@@ -156,6 +156,16 @@ struct Rig {
     return value;
   }
 
+  /// The same source and truth asserted with process-bound evidence. Fencing the
+  /// incarnation that published it must withdraw exactly this evidence and
+  /// demote the record, while durable evidence survives the same fence.
+  static Provenance process_bound_provenance_value() {
+    Provenance value = provenance_value();
+    value.evidence = EvidenceClass::DirectHardwareController;
+    value.source_identity = "concurrency-process-bound";
+    return value;
+  }
+
   FailureDomainId make_domain(std::size_t index, const std::string& scope,
                               const std::string& key,
                               DomainClass klass = DomainClass::Rack) {
@@ -792,7 +802,8 @@ FDR_TEST_CASE(concurrency, publisher_fence_versus_publication) {
         entry.kind = MembershipKind::Direct;
         entry.role = MembershipRole::Primary;
         entry.dependency = DependencySemantics::AnyDependencyFailureAffectsMember;
-        entry.provenance = Rig::provenance_value();
+        // Process-bound evidence: this is what the fence is meant to reach.
+        entry.provenance = Rig::process_bound_provenance_value();
         request.entries.push_back(entry);
         return rig.registry.publish_memberships(request);
       },
@@ -818,6 +829,37 @@ FDR_TEST_CASE(concurrency, publisher_fence_versus_publication) {
         require_valid(rig.registry, "fence versus publication");
         rig.reincarnate(0);
       });
+
+  // The evidence class decides, not the fence: a durable attestation from the
+  // same incarnation survives the identical fence that demotes a process-bound
+  // one, because durable evidence never depended on a live process.
+  {
+    const EntityRef durable_member(EntityClass::Switch, entity_bytes("fence-durable", 0),
+                                   EntityGeneration(1));
+    MembershipBatchRequest request;
+    request.attempt = rig.next_attempt();
+    request.authority = rig.authority(0);
+    request.mode = PublicationMode::Incremental;
+    request.administrative_scope = "dc1";
+    MembershipBatchEntry entry;
+    entry.domain = domain;
+    entry.member = durable_member;
+    entry.kind = MembershipKind::Direct;
+    entry.role = MembershipRole::Primary;
+    entry.dependency = DependencySemantics::AnyDependencyFailureAffectsMember;
+    entry.provenance = Rig::provenance_value();
+    request.entries.push_back(entry);
+    FDR_CHECK_EQ(rig.registry.publish_memberships(request).code, OutcomeCode::Committed);
+    FDR_CHECK_EQ(rig.registry
+                     .fence_worker(rig.publishers[0], rig.boots[0], FenceReason::Administrative,
+                                   rig.epoch)
+                     .code,
+                 OutcomeCode::Committed);
+    const std::vector<Membership> durable_records = rig.registry.memberships_of(durable_member);
+    FDR_CHECK_EQ(durable_records.size(), std::size_t{1});
+    FDR_CHECK_EQ(durable_records.front().lifecycle, MembershipLifecycle::Current);
+    require_valid(rig.registry, "durable evidence versus fencing");
+  }
 }
 
 FDR_TEST_CASE(concurrency, epoch_advance_versus_publication) {
@@ -849,7 +891,9 @@ FDR_TEST_CASE(concurrency, epoch_advance_versus_publication) {
       entry.kind = MembershipKind::Direct;
       entry.role = MembershipRole::Primary;
       entry.dependency = DependencySemantics::AnyDependencyFailureAffectsMember;
-      entry.provenance = Rig::provenance_value();
+      // Process-bound evidence: an epoch advance fences every live incarnation,
+      // and the process-bound evidence they published is what it withdraws.
+      entry.provenance = Rig::process_bound_provenance_value();
       request.entries.push_back(entry);
       published = rig.registry.publish_memberships(request);
     });

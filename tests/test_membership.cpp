@@ -783,6 +783,9 @@ FDR_TEST_CASE(membership, two_publishers_publish_one_membership_record) {
 FDR_TEST_CASE(membership, evidence_corroboration_follows_the_implemented_precedence) {
     Fixture fixture;
     bootstrap(fixture, 0x41u);
+    // Equal-rank disagreement is a disagreement between two authorities, so the
+    // rival statement needs a second publisher.
+    add_second_publisher(fixture, 0x42u);
     const FailureDomainId rack = id_of("dc1", DomainClass::Rack, "rack-r7");
     FDR_CHECK_EQ(create_now(fixture, 1u, DomainClass::Rack, "dc1", "rack-r7", "Rack R7", kOperatorRecord).code,
                  OutcomeCode::Committed);
@@ -867,26 +870,33 @@ FDR_TEST_CASE(membership, evidence_corroboration_follows_the_implemented_precede
     FDR_CHECK_EQ(record->history.size(), std::size_t{2});
     FDR_CHECK_EQ(record->history.front().cause, std::string("reasserted"));
     FDR_CHECK_EQ(record->history.back().cause, std::string("conflicting evidence"));
-    // The step records the state the record was in when the conflict arrived.
-    FDR_CHECK_EQ(record->history.back().lifecycle, MembershipLifecycle::Current);
-    FDR_CHECK_EQ(record->history.back().generation.value(), std::uint64_t{2});
+    // A history entry describes the change it belongs to, so it carries the state
+    // the change produced: the CONFLICTED lifecycle and the generation the record
+    // moved to, not the state it replaced.
+    FDR_CHECK_EQ(record->history.front().generation.value(), std::uint64_t{2});
+    FDR_CHECK_EQ(record->history.front().lifecycle, MembershipLifecycle::Current);
+    FDR_CHECK_EQ(record->history.back().lifecycle, MembershipLifecycle::Conflicted);
+    FDR_CHECK_EQ(record->history.back().generation.value(), std::uint64_t{3});
     check_state(fixture.registry);
 
-    // Exactly the same statement is idempotent, and it does not silently clear
-    // the conflict: the caller's intent is satisfied, the disagreement is not.
+    // Re-stating the authority's own claim is a committed re-attestation while
+    // the record is not current, and it does not silently clear the conflict: the
+    // re-attestation is recorded, the disagreement stays until an operator
+    // resolves it, and the record count still does not grow.
     const RegistryGeneration after_conflict = fixture.registry.generation();
     const Outcome restated = attach_now(fixture, 6u, rack, member,
                                         EvidenceClass::DirectHardwareController,
                                         ProvenanceSource::VendorController, "controller-7");
-    FDR_CHECK_EQ(restated.code, OutcomeCode::Idempotent);
+    FDR_CHECK_EQ(restated.code, OutcomeCode::Committed);
     FDR_CHECK(restated.membership_generation.has_value());
-    FDR_CHECK_EQ(restated.membership_generation->value(), std::uint64_t{3});
-    FDR_CHECK_EQ(fixture.registry.generation(), after_conflict);
+    FDR_CHECK_EQ(restated.membership_generation->value(), std::uint64_t{4});
+    FDR_CHECK(fixture.registry.generation() != after_conflict);
+    FDR_CHECK_EQ(fixture.registry.membership_count(), std::size_t{1});
     record = fixture.registry.membership(id);
     FDR_CHECK(record.has_value());
-    FDR_CHECK_EQ(record->generation.value(), std::uint64_t{3});
+    FDR_CHECK_EQ(record->generation.value(), std::uint64_t{4});
     FDR_CHECK_EQ(record->lifecycle, MembershipLifecycle::Conflicted);
-    FDR_CHECK_EQ(record->evidence.size(), std::size_t{2});
+    FDR_CHECK_EQ(record->evidence.size(), std::size_t{3});
     FDR_CHECK_EQ(record->provenance.source_identity, std::string("controller-7"));
     check_state(fixture.registry);
 }
@@ -1756,16 +1766,15 @@ FDR_TEST_CASE(membership, withdraw_evidence_cannot_reach_a_derived_membership) {
     FDR_CHECK(derived->derivation.valid);
     check_state(fixture.registry);
 
-    // A derived membership carries no publisher on its evidence, so a publisher
-    // demand can never match it. The refusal a caller actually receives is
-    // Idempotent ("nothing of mine is here"), never PolicyRejected, because the
-    // DERIVED guard sits behind the evidence match.
+    // A derived membership is withdrawn by invalidating its sources, never by
+    // evidence withdrawal. The policy refusal is decided before any evidence is
+    // matched, so the caller learns that the request can never apply instead of
+    // being told that nothing happened to match.
     const RegistryGeneration before = fixture.registry.generation();
     const Outcome attempted = fixture.registry.withdraw_evidence(
         withdraw_request(fixture, 7u, setup.derived, MembershipGeneration(1u), true, "not mine"));
-    FDR_CHECK_EQ(attempted.code, OutcomeCode::Idempotent);
-    FDR_CHECK_MSG(attempted.message.find("no matching evidence") != std::string::npos,
-                  attempted.message);
+    FDR_CHECK_EQ(attempted.code, OutcomeCode::PolicyRejected);
+    FDR_CHECK_MSG(attempted.message.find("derived") != std::string::npos, attempted.message);
     FDR_CHECK_EQ(fixture.registry.generation(), before);
 
     const std::optional<Membership> after = fixture.registry.membership(setup.derived);

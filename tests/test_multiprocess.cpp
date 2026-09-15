@@ -497,10 +497,15 @@ FDR_TEST_CASE(multiprocess, real_processes_fence_reincarnate_and_recover) {
   FDR_CHECK_MSG(fences_after_kill > fences_before_kill,
                "the fence list did not grow: " + rendered);
 
+  // Publisher A published with administrative-declaration evidence, which is
+  // durable, so the fence withdraws exactly the fenced incarnation's
+  // process-bound evidence and A's classification keeps its authority. Publisher
+  // B is live and untouched.
+  FDR_CHECK_EQ(observer.query_domain(*rack, &rendered).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(field_of(rendered, "lifecycle"), std::string("CURRENT"));
   FDR_CHECK_EQ(observer.query_domain_members(*rack, &members).code, OutcomeCode::Committed);
   FDR_CHECK_EQ(count_member_lines(members), std::size_t{1});
-  FDR_CHECK_EQ(lifecycle_of_member(members, member_a.to_string()),
-              std::string("REVALIDATION_REQUIRED"));
+  FDR_CHECK_EQ(lifecycle_of_member(members, member_a.to_string()), std::string("CURRENT"));
   FDR_CHECK_EQ(observer.query_domain_members(*pdu, &members).code, OutcomeCode::Committed);
   FDR_CHECK_EQ(count_member_lines(members), std::size_t{1});
   FDR_CHECK_EQ(lifecycle_of_member(members, member_b.to_string()), std::string("CURRENT"));
@@ -563,18 +568,20 @@ FDR_TEST_CASE(multiprocess, real_processes_fence_reincarnate_and_recover) {
                   "OK CONNECTED", &publisher_a2, nullptr, &why),
       why);
 
-  // A plain re-attach is idempotent: it does not restore authority to the
-  // evidence the fenced incarnation published.
+  // The membership never lost authority - its evidence is durable - so the
+  // identical re-attach from the fresh incarnation is an exact replay and it
+  // creates no second record.
   FDR_CHECK_MSG(run_command(publisher_a2, "attach " + rack->to_string() + " " + member_a.to_string(),
                             &result, &why),
                 why);
   FDR_CHECK_MSG(result.rfind("OK IDEMPOTENT", 0) == 0,
                "re-attaching an existing membership answered: " + result);
   FDR_CHECK_EQ(observer.query_domain_members(*rack, &members).code, OutcomeCode::Committed);
-  FDR_CHECK_EQ(lifecycle_of_member(members, member_a.to_string()),
-              std::string("REVALIDATION_REQUIRED"));
+  FDR_CHECK_EQ(lifecycle_of_member(members, member_a.to_string()), std::string("CURRENT"));
 
-  // Re-publishing the classification is what restores authority.
+  // A publication is a desired-state assertion rather than a replay: it
+  // re-attests the classification and commits, while the record count stays at
+  // one because the identity never depended on the writer.
   FDR_CHECK_MSG(run_command(publisher_a2,
                             "publish incremental dc1 switch " + rack->to_string() + " " +
                                 member_a.to_string(),
@@ -713,6 +720,24 @@ FDR_TEST_CASE(multiprocess, real_processes_fence_reincarnate_and_recover) {
         why);
     FDR_CHECK_MSG(run_command(fresh_b, "status", &result, &why), why);
     FDR_CHECK_MSG(result.rfind("OK STATUS", 0) == 0, "status answered: " + result);
+
+    // The process-bound classification B published was demoted by the restart,
+    // and re-attestation is the path back: the CLI's reattest command runs an
+    // ordinary authorized, generation-checked mutation that restores the domain
+    // to CURRENT without inventing a second authority.
+    FDR_CHECK_MSG(run_command(fresh_b, "reattest " + pdu->to_string(), &result, &why), why);
+    FDR_CHECK_MSG(result.rfind("OK COMMITTED", 0) == 0, "reattest answered: " + result);
+    FDR_CHECK_EQ(restarted_observer.query_domain(*pdu, &rendered).code, OutcomeCode::Committed);
+    FDR_CHECK_MSG(field_of(rendered, "lifecycle") == std::string("CURRENT"),
+                  "re-attestation did not restore the demoted domain: " + rendered);
+    // Re-attesting the domain does not silently re-authorize the membership that
+    // the fenced incarnation published: that record is restored by re-attesting
+    // the membership.
+    FDR_CHECK_EQ(restarted_observer.query_domain_members(*pdu, &members).code,
+                 OutcomeCode::Committed);
+    FDR_CHECK_EQ(count_member_lines(members), std::size_t{1});
+    FDR_CHECK_EQ(lifecycle_of_member(members, member_b.to_string()),
+                 std::string("REVALIDATION_REQUIRED"));
 
     // -----------------------------------------------------------------------
     // Cleanup: every child is stopped, every handle is closed and no orphan is

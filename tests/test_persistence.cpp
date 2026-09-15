@@ -689,17 +689,24 @@ FDR_TEST_CASE(persistence, save_and_inspect_reports_agree_on_the_image) {
   FDR_CHECK_EQ(rendered[6], static_cast<std::uint64_t>(report.derivation_rules));
   FDR_CHECK_EQ(rendered[7], static_cast<std::uint64_t>(kStateFormatVersion));
 
-  // The report's digest is the integrity digest of the encoded payload, so it
-  // is recomputable from the file alone - and it is deliberately not the
-  // semantic state digest, which covers the canonical forms instead.
+  // The report's digest is the semantic state digest - the value a consumer
+  // compares against Registry::state_digest() - while the container's own
+  // integrity check stays the payload hash the header carries: recomputable from
+  // the file alone, and independent of the canonical forms.
   const std::string image = slurp(directory.image());
   FDR_CHECK_EQ(image.size(), report.bytes);
   const std::string_view payload(image.data() + failure_domain_registry::kStateHeaderBytes,
                                  image.size() - failure_domain_registry::kStateHeaderBytes -
                                      failure_domain_registry::kStateTrailerBytes);
+  // magic 8 + version 4 + flags 4 + payload length 8, then the payload hash.
+  constexpr std::size_t kPayloadHashOffset = 8u + 4u + 4u + 8u;
+  const std::string_view stored_payload_hash(image.data() + kPayloadHashOffset, 32u);
   const auto payload_digest = sha256(payload);
-  FDR_CHECK_EQ(report.digest.to_string(), to_hex(payload_digest.data(), payload_digest.size()));
-  FDR_CHECK(!(report.digest == source.state_digest()));
+  FDR_CHECK_EQ(
+      to_hex(reinterpret_cast<const std::uint8_t*>(stored_payload_hash.data()),
+             stored_payload_hash.size()),
+      to_hex(payload_digest.data(), payload_digest.size()));
+  FDR_CHECK_EQ(report.digest, source.state_digest());
 
   // A second inspection is byte-for-byte the same, so nothing is cached.
   PersistenceReport again;
@@ -871,13 +878,24 @@ FDR_TEST_CASE(persistence, configuration_is_honoured_and_leaves_no_temporary_fil
   FDR_CHECK_EQ(count_files(directory.path), std::size_t{1});
   PersistenceReport report;
   FDR_CHECK_EQ(inspect_persistence(config, &report).code, OutcomeCode::Committed);
+  // The report's digest is the semantic state digest of the image, so it agrees
+  // with the registry it was written from and with the registry that reads it
+  // back, not merely with the container's payload hash.
+  FDR_CHECK_EQ(report.digest, registry.state_digest());
+  Registry reloaded(RegistryLimits::defaults());
+  FDR_CHECK_EQ(reloaded.load(config).code, OutcomeCode::Committed);
+  FDR_CHECK_EQ(report.digest, reloaded.state_digest());
   const std::string image = slurp(directory.image());
   const std::string_view payload(image.data() + failure_domain_registry::kStateHeaderBytes,
                                  image.size() - failure_domain_registry::kStateHeaderBytes -
                                      failure_domain_registry::kStateTrailerBytes);
+  constexpr std::size_t kPayloadHashOffset = 8u + 4u + 4u + 8u;
+  const std::string_view stored_payload_hash(image.data() + kPayloadHashOffset, 32u);
   const auto payload_digest = sha256(payload);
-  FDR_CHECK_EQ(report.digest.to_string(),
-               to_hex(payload_digest.data(), payload_digest.size()));
+  FDR_CHECK_EQ(
+      to_hex(reinterpret_cast<const std::uint8_t*>(stored_payload_hash.data()),
+             stored_payload_hash.size()),
+      to_hex(payload_digest.data(), payload_digest.size()));
 }
 
 // ---------------------------------------------------------------------------
