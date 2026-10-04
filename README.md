@@ -1,7 +1,7 @@
 # Failure Domain Registry
 
 Failure Domain Registry is the authoritative correlated-failure classification
-runtime of the Distributed Fabric Infrastructure ("Fabric OS") stack. It
+runtime for data-center fabric infrastructure. It
 answers one question:
 
 > Which infrastructure entities share a common failure domain, how are those
