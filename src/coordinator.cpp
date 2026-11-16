@@ -436,7 +436,6 @@ void Coordinator::Impl::serve(std::shared_ptr<TcpSocket> socket,
       const Outcome frame_result =
           decode_frame(std::string_view(buffer).substr(0, total), config.frames, &header,
                        &payload, &consumed);
-      buffer.erase(0, total);
       if (!frame_result.committed()) {
         const std::lock_guard<std::mutex> guard(stats_mutex);
         ++stats.frames_rejected;
@@ -451,6 +450,9 @@ void Coordinator::Impl::serve(std::shared_ptr<TcpSocket> socket,
       bool is_mutation = false;
       const Outcome outcome =
           dispatch(payload, &rendered, &is_mutation, &attached, &attached_publisher, &attached_boot);
+      // payload views buffer, so the frame leaves the buffer only once it has been
+      // dispatched: erasing it first shifted the next buffered frame over the payload.
+      buffer.erase(0, total);
       if (is_mutation) {
         const std::lock_guard<std::mutex> guard(stats_mutex);
         if (outcome.committed() || outcome.code == OutcomeCode::Idempotent) {
@@ -540,12 +542,21 @@ void Coordinator::Impl::accept_loop() {
     if (!got_connection) {
       continue;
     }
+    // The bound limits sessions that are live at once (finished ones were reaped just
+    // above). Comparing the lifetime count of accepted sessions instead refused every
+    // connection once max_sessions sessions had ever been accepted.
+    std::size_t live = 0;
+    {
+      const std::lock_guard<std::mutex> guard(sessions_mutex);
+      live = sessions.size();
+    }
     {
       const std::lock_guard<std::mutex> guard(stats_mutex);
-      if (++stats.sessions_accepted > config.frames.max_sessions) {
+      if (live >= config.frames.max_sessions) {
         ++stats.sessions_rejected;
         continue;
       }
+      ++stats.sessions_accepted;
     }
     auto finished = std::make_shared<std::atomic<bool>>(false);
     SessionHandle handle;

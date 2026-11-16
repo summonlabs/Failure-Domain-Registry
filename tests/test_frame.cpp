@@ -23,11 +23,14 @@
 #include <thread>
 #include <vector>
 
+#include "failure_domain_registry/coordinator.hpp"
 #include "failure_domain_registry/digest.hpp"
 #include "failure_domain_registry/frame.hpp"
 #include "failure_domain_registry/transport.hpp"
 #include "failure_domain_registry/version.hpp"
 #include "support/test_harness.hpp"
+// The wire codec is internal; this file drives a coordinator with raw frames.
+#include "../src/message_codec.hpp"
 
 namespace {
 
@@ -764,3 +767,137 @@ FDR_TEST_CASE(frame, send_all_delivers_a_payload_larger_than_the_internal_chunk_
 }
 
 int main(int argc, char** argv) { return fdrtest::run_all(argc, argv); }
+
+FDR_TEST_CASE(frame, a_coordinator_keeps_accepting_after_its_session_bound_worth_of_connections) {
+  failure_domain_registry::CoordinatorConfig config;
+  config.bind_address = "127.0.0.1";
+  config.port = 0;
+  config.load_on_start = false;
+  config.save_on_commit = false;
+  config.frames.max_sessions = 2;
+  config.accept_poll_ms = 5;
+  failure_domain_registry::Coordinator coordinator(config);
+  std::string endpoint;
+  FDR_CHECK_EQ(coordinator.start(&endpoint).code, OutcomeCode::Committed);
+  const std::uint16_t port = coordinator.bound_port();
+  // The bound limits sessions that are live at once. Connections that come and go one
+  // at a time never exceed it, however many of them there are over time.
+  constexpr std::size_t kConnections = 6;
+  for (std::size_t index = 0; index < kConnections; ++index) {
+    {
+      TcpSocket client;
+      FDR_CHECK_EQ(failure_domain_registry::connect_to(Endpoint{"127.0.0.1", port}, 5000, &client).code,
+                   OutcomeCode::Committed);
+    }
+    // The coordinator has taken this connection: served it to the end, or refused it.
+    for (;;) {
+      const failure_domain_registry::CoordinatorStats stats = coordinator.stats();
+      if (stats.sessions_completed + stats.sessions_rejected >= index + 1) break;
+      std::this_thread::yield();
+    }
+  }
+  const failure_domain_registry::CoordinatorStats stats = coordinator.stats();
+  FDR_CHECK_EQ(stats.sessions_rejected, std::size_t{0});
+  FDR_CHECK_EQ(stats.sessions_completed, kConnections);
+  FDR_CHECK_EQ(coordinator.stop().code, OutcomeCode::Committed);
+}
+
+FDR_TEST_CASE(frame, a_second_listener_cannot_take_a_listening_port) {
+  TcpListener first;
+  FDR_CHECK_EQ(failure_domain_registry::listen_on("127.0.0.1", 0, 4, &first).code, OutcomeCode::Committed);
+  const std::uint16_t port = first.bound_port();
+  FDR_CHECK(port != 0);
+  // Two coordinators must never share one listening port: the second listen fails.
+  TcpListener second;
+  FDR_CHECK(failure_domain_registry::listen_on("127.0.0.1", port, 4, &second).code != OutcomeCode::Committed);
+}
+
+namespace {
+
+/// One request payload of the given operation with default authority.
+void request_payload(failure_domain_registry::Operation op, const std::string& label,
+                     std::string* payload) {
+  failure_domain_registry::WireRequest request;
+  request.op = op;
+  request.label = label;
+  FDR_CHECK_EQ(failure_domain_registry::encode_wire_request(request, payload).code,
+               OutcomeCode::Committed);
+}
+
+/// Reads one response frame from the socket and decodes its body.
+void read_response(TcpSocket& socket, const FrameLimits& limits,
+                   failure_domain_registry::WireResponse* response) {
+  std::string header_bytes;
+  FDR_CHECK_EQ(socket.recv_exact(failure_domain_registry::kFrameHeaderBytes, &header_bytes).code,
+               OutcomeCode::Committed);
+  FrameHeader header;
+  FDR_CHECK_EQ(failure_domain_registry::decode_frame_header(header_bytes, limits, &header).code,
+               OutcomeCode::Committed);
+  std::string body;
+  if (header.payload_bytes > 0) {
+    FDR_CHECK_EQ(socket.recv_exact(header.payload_bytes, &body).code, OutcomeCode::Committed);
+  }
+  const std::string complete = header_bytes + body;
+  std::string_view payload;
+  std::size_t consumed = 0;
+  FDR_CHECK_EQ(failure_domain_registry::decode_frame(complete, limits, &header, &payload, &consumed).code,
+               OutcomeCode::Committed);
+  FDR_CHECK_EQ(header.type, MessageType::Response);
+  FDR_CHECK_EQ(failure_domain_registry::decode_wire_response(payload, response).code,
+               OutcomeCode::Committed);
+}
+
+}  // namespace
+
+FDR_TEST_CASE(frame, pipelined_requests_are_each_served_from_their_own_payload) {
+  failure_domain_registry::CoordinatorConfig config;
+  config.bind_address = "127.0.0.1";
+  config.port = 0;
+  config.load_on_start = false;
+  config.save_on_commit = false;
+  config.accept_poll_ms = 5;
+  failure_domain_registry::Coordinator coordinator(config);
+  std::string endpoint;
+  FDR_CHECK_EQ(coordinator.start(&endpoint).code, OutcomeCode::Committed);
+
+  // Two requests with payloads of the same length that the coordinator answers
+  // differently, written back to back in one send so they reach it together.
+  std::string status_payload;
+  request_payload(failure_domain_registry::Operation::QueryStatus, "first", &status_payload);
+  std::string heartbeat_payload;
+  request_payload(failure_domain_registry::Operation::Heartbeat, "other", &heartbeat_payload);
+  FDR_CHECK_EQ(status_payload.size(), heartbeat_payload.size());
+  std::string frames;
+  std::string encoded;
+  FDR_CHECK_EQ(failure_domain_registry::encode_frame(MessageType::Query, 1, status_payload,
+                                                     config.frames.max_payload_bytes, encoded).code,
+               OutcomeCode::Committed);
+  frames += encoded;
+  encoded.clear();
+  FDR_CHECK_EQ(failure_domain_registry::encode_frame(MessageType::Query, 2, heartbeat_payload,
+                                                     config.frames.max_payload_bytes, encoded).code,
+               OutcomeCode::Committed);
+  frames += encoded;
+
+  TcpSocket client;
+  FDR_CHECK_EQ(failure_domain_registry::connect_to(Endpoint{"127.0.0.1", coordinator.bound_port()},
+                                                   5000, &client).code,
+               OutcomeCode::Committed);
+  FDR_CHECK_EQ(client.send_all(frames).code, OutcomeCode::Committed);
+
+  // Each request is answered from its own payload, in order.
+  failure_domain_registry::WireResponse first;
+  read_response(client, config.frames, &first);
+  FDR_CHECK_EQ(first.code, OutcomeCode::Committed);
+  FDR_CHECK_MSG(first.message == "status",
+                "the first request was answered as '" + first.message + "', not as the status query");
+  failure_domain_registry::WireResponse second;
+  read_response(client, config.frames, &second);
+  FDR_CHECK_EQ(second.code, OutcomeCode::Committed);
+  FDR_CHECK_MSG(second.message == "alive",
+                "the second request was answered as '" + second.message + "', not as the heartbeat");
+
+  client.shutdown_both();
+  client.close();
+  FDR_CHECK_EQ(coordinator.stop().code, OutcomeCode::Committed);
+}
